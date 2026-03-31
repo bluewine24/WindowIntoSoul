@@ -1,71 +1,64 @@
 model:
-  encoder: "roberta-base"
-  freeze_encoder: true
-  unfreeze_top_layers: 2          # unfreeze after phase 1 plateau
-  mode_dim: 32
-  gru_hidden: 256
-  gru_layers: 2
-  gru_dropout: 0.2
-  interpretable_dims: 5           # valence, arousal, playfulness, shyness, affection
-  latent_dims: 8
-  output_dims: 13                 # 5 + 8
-
-emotion:
-  interpretable:
-    - valence
-    - arousal
-    - playfulness
-    - shyness
-    - affection
-  # per-dim smoothness weights — slow dims penalized more
-  smoothness_weights:
-    valence:     0.15
-    arousal:     0.05             # allow fast spikes
-    playfulness: 0.10
-    shyness:     0.25             # should move slowly
-    affection:   0.25             # should move slowly
-  # weak label dims — lower loss weight early
-  weak_label_dims:
-    - playfulness
-    - shyness
-    - affection
-  weak_label_weight: 0.3          # multiply loss for weak dims in phase 1-2
-
-modes:
-  - SPEAKING
-  - LISTENING
-  - REACTING
-  - THINKING
-  - IDLE
+  encoder_name: roberta-base
+  local_files_only: true
+  freeze_text_encoder: true
+  allow_mock_encoder_fallback: true
+  encoder_hidden_size: 768
+  mock_vocab_size: 4096
+  max_tokens: 96
+  role_vocab:
+    - self
+    - other
+    - narrator
+  role_embedding_dim: 32
+  utterance_dim: 768
+  character_dim: 64
+  character_hidden_dim: 256
+  char_step_dim: 128
+  turn_distance_buckets: 16
+  turn_distance_embedding_dim: 16
+  memory_window: 12
+  context_attention_heads: 8
+  recurrent_hidden_size: 512
+  recurrent_layers: 2
+  recurrent_dropout: 0.1
+  latent_dim: 128
+  vad_dim: 3
+  appraisal_dim: 5
+  discrete_dim: 14
+  gate_type: context
+  gate_hidden_dim: 256
 
 training:
-  batch_size: 16
-  max_clauses: 16
-  max_tokens_per_clause: 64
-  learning_rate: 2.0e-4
-  encoder_lr: 1.0e-5              # lower lr when unfreezing encoder
+  batch_size: 2
+  num_workers: 0
+  base_epochs: 4
+  gate_epochs: 2
+  joint_epochs: 2
+  lr: 0.0002
+  gate_lr: 0.0001
+  joint_lr: 0.0001
+  encoder_lr: 0.00001
   weight_decay: 0.01
-  max_epochs: 50
-  patience: 5                     # early stopping
-  phase1_epochs: 10               # valence/arousal only
-  phase2_epochs: 20               # add weak dims
-  loss_weights:
-    interpretable: 1.0
-    contrastive: 0.3
-    smoothness: 0.1
-  contrastive_temperature: 0.07
+  gradient_clip_norm: 1.0
   contrastive_margin: 0.5
+  label_smoothing: 0.0
+  joint_gate_scale: 0.5
+  checkpoint_dir: checkpoints
+  seed: 42
+  loss_weights:
+    vad: 1.0
+    appraisal: 0.7
+    discrete: 0.5
+    smoothness: 0.05
+    contrastive: 0.1
+    consistency: 0.02
+    gate_smoothness: 0.15
+    gate_fidelity: 0.2
 
 data:
-  # Output of build_dataset.py
-  train_path: "emotion_data/train.csv"
-  val_path:   "emotion_data/val.csv"
-  eval_set_path: "emotion_data/eval.csv"   # or "data/eval_set.csv" for old hand-curated format
-  contrastive_pairs_path: "emotion_data/contrastive_pairs.csv"
-  seed: 42
+  train_path: sample_data/train.jsonl
+  val_path: sample_data/val.jsonl
 
-logging:
-  log_dir: "runs/"
-  save_dir: "checkpoints/"
-  eval_every_n_epochs: 1
-  visualize_every_n_epochs: 2
+inference:
+  output_path: outputs/inference.json

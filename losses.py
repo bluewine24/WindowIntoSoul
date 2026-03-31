@@ -1,229 +1,252 @@
-"""
-Loss functions for text2emotion training.
-
-Three components:
-  1. Interpretable regression loss (MSE / SmoothL1)
-  2. Latent contrastive loss
-  3. Temporal smoothness loss  — dimension-aware weights
-"""
-
 from __future__ import annotations
+
+from typing import Any
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, List, Optional
+
+from datasets import DialogueExample
 
 
-# ---------------------------------------------------------------------------
-# Per-dimension smoothness weights
-# ---------------------------------------------------------------------------
-
-# Slow dims: shyness, affection should not spike
-# Fast dims: arousal, surprise can spike freely
-SMOOTHNESS_WEIGHTS = {
-    "valence":     0.15,
-    "arousal":     0.05,
-    "playfulness": 0.10,
-    "shyness":     0.25,
-    "affection":   0.25,
-}
-
-# Phase-dependent loss weight for weak-supervised dims
-WEAK_DIMS = {"playfulness", "shyness", "affection"}
-WEAK_DIM_INDICES = [2, 3, 4]   # indices in the 5-dim interpretable vector
+def _zero(device: torch.device) -> torch.Tensor:
+    return torch.tensor(0.0, device=device)
 
 
-# ---------------------------------------------------------------------------
-# 1. Interpretable regression loss
-# ---------------------------------------------------------------------------
+def _masked_regression_loss(prediction: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    if mask.sum() == 0:
+        return _zero(prediction.device)
+    loss = F.smooth_l1_loss(prediction, target, reduction="none")
+    loss = loss * mask
+    return loss.sum() / mask.sum()
 
-class InterpretableLoss(nn.Module):
-    """
-    MSE loss on interpretable dims.
-    Applies lower weight to weak-supervised dims (playfulness/shyness/affection).
-    """
-    def __init__(self, weak_label_weight: float = 0.3):
+
+def _label_aware_smoothness(latent: torch.Tensor, discrete_targets: torch.Tensor, discrete_mask: torch.Tensor) -> torch.Tensor:
+    if latent.size(0) < 2:
+        return _zero(latent.device)
+    delta = latent[1:] - latent[:-1]
+    magnitude = delta.pow(2).mean(dim=-1)
+
+    pair_weights = torch.full((latent.size(0) - 1,), 0.6, device=latent.device)
+    valid_pairs = discrete_mask[1:] & discrete_mask[:-1]
+    same_label = discrete_targets[1:] == discrete_targets[:-1]
+    pair_weights = torch.where(valid_pairs & same_label, torch.full_like(pair_weights, 1.0), pair_weights)
+    pair_weights = torch.where(valid_pairs & (~same_label), torch.full_like(pair_weights, 0.35), pair_weights)
+    return torch.mean(magnitude * pair_weights)
+
+
+class EmotionTrajectoryLoss(nn.Module):
+    def __init__(self, config: dict[str, Any]):
         super().__init__()
-        self.weak_weight = weak_label_weight
+        training_cfg = config["training"]
+        self.weights = training_cfg["loss_weights"]
+        self.contrastive_margin = float(training_cfg["contrastive_margin"])
+        self.label_smoothing = float(training_cfg["label_smoothing"])
+        self.joint_gate_scale = float(training_cfg["joint_gate_scale"])
 
-    def forward(self,
-                pred: torch.Tensor,         # [M, 5]
-                target: torch.Tensor,       # [M, 5]
-                label_mask: Optional[torch.Tensor] = None,   # [M, 5] binary
-                phase: int = 1) -> torch.Tensor:
-        """
-        Args:
-            pred:        predicted [M, 5]
-            target:      ground truth [M, 5]
-            label_mask:  1 where label exists, 0 where unknown
-            phase:       training phase — weak dims down-weighted in phase 1
-        """
-        loss = F.mse_loss(pred, target, reduction="none")   # [M, 5]
+    def _build_targets(self, example: DialogueExample, role_to_id: dict[str, int], device: torch.device) -> dict[str, torch.Tensor]:
+        vad_targets = []
+        vad_mask = []
+        appraisal_targets = []
+        appraisal_mask = []
+        discrete_targets = []
+        discrete_mask = []
+        role_ids = []
 
-        # Down-weight weak dims in early phases
-        if phase <= 2:
-            weights = torch.ones(5, device=pred.device)
-            for idx in WEAK_DIM_INDICES:
-                weights[idx] = self.weak_weight
-            loss = loss * weights.unsqueeze(0)
+        for turn in example.turns:
+            role_ids.append(role_to_id.get(turn.role.lower(), role_to_id["other"]))
 
-        # Apply label mask if provided (ignore unlabeled dims)
-        if label_mask is not None:
-            loss = loss * label_mask
+            if turn.labels.vad is None:
+                vad_targets.append([0.0, 0.0, 0.0])
+                vad_mask.append([0.0, 0.0, 0.0])
+            else:
+                vad_targets.append([float(v) for v in turn.labels.vad])
+                vad_mask.append([1.0, 1.0, 1.0])
 
-        return loss.mean()
+            if turn.labels.appraisal is None:
+                appraisal_targets.append([0.0] * 5)
+                appraisal_mask.append([0.0] * 5)
+            else:
+                appraisal_targets.append([float(v) for v in turn.labels.appraisal])
+                appraisal_mask.append([1.0] * len(turn.labels.appraisal))
 
-
-# ---------------------------------------------------------------------------
-# 2. Latent contrastive loss (NT-Xent style)
-# ---------------------------------------------------------------------------
-
-class LatentContrastiveLoss(nn.Module):
-    """
-    NT-Xent contrastive loss on latent dims.
-
-    Positive pairs: same conversation / same mode (defined by pair_indices).
-    Hard negatives: opposite valence/arousal direction.
-
-    Temperature controls sharpness — lower = harder.
-    """
-    def __init__(self, temperature: float = 0.07):
-        super().__init__()
-        self.temp = temperature
-
-    def forward(self,
-                latent: torch.Tensor,           # [B, 8]  — batch of clause latents
-                positive_pairs: torch.Tensor,   # [P, 2]  — index pairs that are similar
-                ) -> torch.Tensor:
-        """
-        Args:
-            latent:         [B, 8] latent vectors for a batch of clauses
-            positive_pairs: [P, 2] index pairs of positive (similar) clauses
-        """
-        if positive_pairs.shape[0] == 0:
-            return torch.tensor(0.0, device=latent.device)
-
-        # L2 normalize
-        z = F.normalize(latent, dim=-1)         # [B, 8]
-
-        # Cosine similarity matrix
-        sim = torch.mm(z, z.T) / self.temp      # [B, B]
-
-        # Mask out diagonal (self-similarity)
-        mask_diag = torch.eye(latent.shape[0], dtype=torch.bool, device=latent.device)
-        sim = sim.masked_fill(mask_diag, -1e9)
-
-        # For each positive pair, compute NT-Xent loss
-        losses = []
-        for i, j in positive_pairs:
-            # i should predict j
-            log_prob = sim[i] - torch.logsumexp(sim[i], dim=0)
-            losses.append(-log_prob[j])
-
-        return torch.stack(losses).mean()
-
-
-# ---------------------------------------------------------------------------
-# 3. Temporal smoothness loss
-# ---------------------------------------------------------------------------
-
-class SmoothnessLoss(nn.Module):
-    """
-    Penalizes sharp changes between neighboring clause emotion states.
-    Per-dimension weights: slow dims (shyness, affection) penalized more.
-    Arousal/surprise can spike — penalized least.
-    """
-    def __init__(self, dim_weights: Optional[List[float]] = None):
-        super().__init__()
-        if dim_weights is None:
-            # [valence, arousal, playfulness, shyness, affection]
-            dim_weights = [
-                SMOOTHNESS_WEIGHTS["valence"],
-                SMOOTHNESS_WEIGHTS["arousal"],
-                SMOOTHNESS_WEIGHTS["playfulness"],
-                SMOOTHNESS_WEIGHTS["shyness"],
-                SMOOTHNESS_WEIGHTS["affection"],
-            ]
-        self.register_buffer(
-            "weights",
-            torch.tensor(dim_weights, dtype=torch.float)
-        )
-
-    def forward(self, trajectory: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            trajectory: [M, D] — sequence of emotion vectors (interpretable dims only)
-        Returns:
-            scalar smoothness loss
-        """
-        if trajectory.shape[0] < 2:
-            return torch.tensor(0.0, device=trajectory.device)
-
-        delta = trajectory[1:] - trajectory[:-1]           # [M-1, D]
-        delta_sq = delta.pow(2)                             # [M-1, D]
-
-        n_dims = min(delta_sq.shape[-1], self.weights.shape[0])
-        weighted = delta_sq[:, :n_dims] * self.weights[:n_dims].to(trajectory.device)
-
-        return weighted.mean()
-
-
-# ---------------------------------------------------------------------------
-# Combined loss
-# ---------------------------------------------------------------------------
-
-class Text2EmotionLoss(nn.Module):
-    """
-    Combined loss for text2emotion training.
-
-      L = w_interp * interp_loss
-        + w_contrast * contrastive_loss
-        + w_smooth * smoothness_loss
-    """
-    def __init__(self,
-                 w_interpretable: float = 1.0,
-                 w_contrastive: float = 0.3,
-                 w_smoothness: float = 0.1,
-                 weak_label_weight: float = 0.3,
-                 temperature: float = 0.07):
-        super().__init__()
-
-        self.w_i = w_interpretable
-        self.w_c = w_contrastive
-        self.w_s = w_smoothness
-
-        self.interp_loss    = InterpretableLoss(weak_label_weight)
-        self.contrastive    = LatentContrastiveLoss(temperature)
-        self.smoothness     = SmoothnessLoss()
-
-    def forward(self,
-                pred_interp: torch.Tensor,          # [M, 5]
-                pred_latent: torch.Tensor,          # [M, 8]
-                target_interp: torch.Tensor,        # [M, 5]
-                label_mask: Optional[torch.Tensor] = None,
-                positive_pairs: Optional[torch.Tensor] = None,
-                phase: int = 1) -> Dict[str, torch.Tensor]:
-
-        # 1. Regression on interpretable dims
-        l_interp = self.interp_loss(pred_interp, target_interp, label_mask, phase)
-
-        # 2. Contrastive on latent dims
-        if positive_pairs is not None and positive_pairs.shape[0] > 0:
-            l_contrast = self.contrastive(pred_latent, positive_pairs)
-        else:
-            l_contrast = torch.tensor(0.0, device=pred_interp.device)
-
-        # 3. Smoothness on interpretable trajectory
-        l_smooth = self.smoothness(pred_interp)
-
-        total = (self.w_i * l_interp +
-                 self.w_c * l_contrast +
-                 self.w_s * l_smooth)
+            if turn.labels.discrete is None:
+                discrete_targets.append(0)
+                discrete_mask.append(False)
+            else:
+                discrete_targets.append(int(turn.labels.discrete))
+                discrete_mask.append(True)
 
         return {
-            "total":       total,
-            "interpretable": l_interp,
-            "contrastive": l_contrast,
-            "smoothness":  l_smooth,
+            "vad_targets": torch.tensor(vad_targets, dtype=torch.float32, device=device),
+            "vad_mask": torch.tensor(vad_mask, dtype=torch.float32, device=device),
+            "appraisal_targets": torch.tensor(appraisal_targets, dtype=torch.float32, device=device),
+            "appraisal_mask": torch.tensor(appraisal_mask, dtype=torch.float32, device=device),
+            "discrete_targets": torch.tensor(discrete_targets, dtype=torch.long, device=device),
+            "discrete_mask": torch.tensor(discrete_mask, dtype=torch.bool, device=device),
+            "role_ids": torch.tensor(role_ids, dtype=torch.long, device=device),
         }
+
+    def _cross_entropy(self, logits: torch.Tensor, targets: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        if not mask.any():
+            return _zero(logits.device)
+        return F.cross_entropy(logits[mask], targets[mask], label_smoothing=self.label_smoothing)
+
+    def _contrastive_loss(
+        self,
+        latents: torch.Tensor,
+        discrete_targets: torch.Tensor,
+        role_ids: torch.Tensor,
+        discrete_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        if discrete_mask.sum() < 3:
+            return _zero(latents.device)
+
+        z = F.normalize(latents[discrete_mask], dim=-1)
+        labels = discrete_targets[discrete_mask]
+        roles = role_ids[discrete_mask]
+        distances = torch.cdist(z, z, p=2)
+        losses = []
+
+        for index in range(z.size(0)):
+            positive_mask = (labels == labels[index]) & (roles == roles[index])
+            positive_mask[index] = False
+            negative_mask = labels != labels[index]
+            if positive_mask.any() and negative_mask.any():
+                positive_distance = distances[index][positive_mask].mean()
+                negative_distance = distances[index][negative_mask].mean()
+                losses.append(F.relu(positive_distance - negative_distance + self.contrastive_margin))
+
+        if not losses:
+            return _zero(latents.device)
+        return torch.stack(losses).mean()
+
+    def _consistency_loss(
+        self,
+        latents: torch.Tensor,
+        discrete_targets: torch.Tensor,
+        role_ids: torch.Tensor,
+        discrete_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        if discrete_mask.sum() < 2:
+            return _zero(latents.device)
+
+        z = latents[discrete_mask]
+        labels = discrete_targets[discrete_mask]
+        roles = role_ids[discrete_mask]
+        distances = torch.cdist(z, z, p=2)
+        losses = []
+
+        for index in range(z.size(0)):
+            positive_mask = (labels == labels[index]) & (roles == roles[index])
+            positive_mask[index] = False
+            if positive_mask.any():
+                losses.append(distances[index][positive_mask].mean())
+
+        if not losses:
+            return _zero(latents.device)
+        return torch.stack(losses).mean()
+
+    def forward(self, model: nn.Module, outputs: list[Any], batch: list[DialogueExample], stage: str) -> dict[str, torch.Tensor]:
+        device = outputs[0].z_emotion.device
+        metrics = {
+            "vad": _zero(device),
+            "appraisal": _zero(device),
+            "discrete": _zero(device),
+            "smoothness": _zero(device),
+            "contrastive": _zero(device),
+            "consistency": _zero(device),
+            "stable_vad": _zero(device),
+            "stable_appraisal": _zero(device),
+            "stable_discrete": _zero(device),
+            "gate_smoothness": _zero(device),
+            "gate_fidelity": _zero(device),
+        }
+
+        pairwise_latents = []
+        pairwise_labels = []
+        pairwise_roles = []
+        pairwise_masks = []
+
+        for output, example in zip(outputs, batch):
+            targets = self._build_targets(example, model.role_to_id, device=device)
+
+            if stage in {"base", "joint"}:
+                metrics["vad"] += _masked_regression_loss(output.vad, targets["vad_targets"], targets["vad_mask"])
+                metrics["appraisal"] += _masked_regression_loss(
+                    output.appraisal, targets["appraisal_targets"], targets["appraisal_mask"]
+                )
+                metrics["discrete"] += self._cross_entropy(
+                    output.discrete_logits, targets["discrete_targets"], targets["discrete_mask"]
+                )
+                metrics["smoothness"] += _label_aware_smoothness(
+                    output.z_emotion, targets["discrete_targets"], targets["discrete_mask"]
+                )
+                pairwise_latents.append(output.z_emotion)
+                pairwise_labels.append(targets["discrete_targets"])
+                pairwise_roles.append(targets["role_ids"])
+                pairwise_masks.append(targets["discrete_mask"])
+
+            if stage in {"gate", "joint"}:
+                stable_vad, stable_appraisal, stable_discrete = model.heads_from_latent(output.z_stable)
+                metrics["stable_vad"] += _masked_regression_loss(
+                    stable_vad, targets["vad_targets"], targets["vad_mask"]
+                )
+                metrics["stable_appraisal"] += _masked_regression_loss(
+                    stable_appraisal, targets["appraisal_targets"], targets["appraisal_mask"]
+                )
+                metrics["stable_discrete"] += self._cross_entropy(
+                    stable_discrete, targets["discrete_targets"], targets["discrete_mask"]
+                )
+                metrics["gate_smoothness"] += _label_aware_smoothness(
+                    output.z_stable, targets["discrete_targets"], targets["discrete_mask"]
+                )
+                if output.z_stable.size(0) > 1:
+                    metrics["gate_fidelity"] += F.mse_loss(output.z_stable[1:], output.z_emotion.detach()[1:])
+                if stage == "gate":
+                    pairwise_latents.append(output.z_stable)
+                    pairwise_labels.append(targets["discrete_targets"])
+                    pairwise_roles.append(targets["role_ids"])
+                    pairwise_masks.append(targets["discrete_mask"])
+
+        divisor = max(len(batch), 1)
+        for name in metrics:
+            metrics[name] = metrics[name] / divisor
+
+        if pairwise_latents:
+            stacked_latents = torch.cat(pairwise_latents, dim=0)
+            stacked_labels = torch.cat(pairwise_labels, dim=0)
+            stacked_roles = torch.cat(pairwise_roles, dim=0)
+            stacked_masks = torch.cat(pairwise_masks, dim=0)
+            metrics["contrastive"] = self._contrastive_loss(
+                stacked_latents, stacked_labels, stacked_roles, stacked_masks
+            )
+            metrics["consistency"] = self._consistency_loss(
+                stacked_latents, stacked_labels, stacked_roles, stacked_masks
+            )
+
+        base_total = (
+            (self.weights["vad"] * metrics["vad"])
+            + (self.weights["appraisal"] * metrics["appraisal"])
+            + (self.weights["discrete"] * metrics["discrete"])
+            + (self.weights["smoothness"] * metrics["smoothness"])
+            + (self.weights["contrastive"] * metrics["contrastive"])
+            + (self.weights["consistency"] * metrics["consistency"])
+        )
+        gate_total = (
+            (self.weights["vad"] * metrics["stable_vad"])
+            + (self.weights["appraisal"] * metrics["stable_appraisal"])
+            + (self.weights["discrete"] * metrics["stable_discrete"])
+            + (self.weights["gate_smoothness"] * metrics["gate_smoothness"])
+            + (self.weights["gate_fidelity"] * metrics["gate_fidelity"])
+        )
+
+        if stage == "base":
+            total = base_total
+        elif stage == "gate":
+            total = gate_total
+        else:
+            total = base_total + (self.joint_gate_scale * gate_total)
+
+        metrics["total"] = total
+        return metrics

@@ -1,139 +1,101 @@
-"""
-inference.py — interactive testing of the text2emotion model.
-
-Usage:
-    python inference.py                        # interactive REPL
-    python inference.py --checkpoint path.pt   # load specific checkpoint
-    python inference.py --eval                 # run on full eval set
-"""
+from __future__ import annotations
 
 import argparse
+import json
+from pathlib import Path
+from typing import Any
+
 import torch
+import yaml
 
-from models.text2emotion import Text2EmotionModel, MODES
-from evaluation.visualizer import TrajectoryVisualizer
-from data.datasets import EvalSetDataset
-
-
-# ---------------------------------------------------------------------------
-# Sanity check sentences — run these first after any training milestone
-# ---------------------------------------------------------------------------
-
-SANITY_CHECKS = [
-    ("hehe, no way",                        "SPEAKING"),
-    ("uh... thanks",                        "REACTING"),
-    ("wait WHAT??",                         "REACTING"),
-    ("that's fine, really",                 "SPEAKING"),
-    ("you actually did that for me?",       "REACTING"),
-    ("...oh",                               "REACTING"),
-    ("stoooop you're embarrassing me",      "SPEAKING"),
-    ("I knew it!! I knew it!!",             "SPEAKING"),
-    ("oh. okay.",                           "REACTING"),
-    ("noooo that's so cute!!",              "REACTING"),
-    ("hmm... I'm not sure about this",      "THINKING"),
-    ("ehehe, maybe~",                       "SPEAKING"),
-]
+from datasets import DialogueExample, dialogue_from_dict, load_dialogue_json
+from text2emotion import TextToEmotionTrajectoryModel
+from visualizer import TrajectoryVisualizer
 
 
-def load_model(checkpoint_path: str = None,
-               config_path: str = "configs/config.yaml") -> Text2EmotionModel:
-    import yaml
-    with open(config_path) as f:
-        cfg = yaml.safe_load(f)
+def load_config(path: str) -> dict[str, Any]:
+    with Path(path).open("r", encoding="utf-8") as handle:
+        return yaml.safe_load(handle)
 
-    mc = cfg["model"]
-    model = Text2EmotionModel(
-        encoder_name=       mc["encoder"],
-        mode_dim=           mc["mode_dim"],
-        gru_hidden=         mc["gru_hidden"],
-        gru_layers=         mc["gru_layers"],
-        gru_dropout=        mc["gru_dropout"],
-        interpretable_dims= mc["interpretable_dims"],
-        latent_dims=        mc["latent_dims"],
-        freeze_encoder=     False,   # inference mode
-    )
 
-    if checkpoint_path:
-        ckpt = torch.load(checkpoint_path, map_location="cpu")
-        model.load_state_dict(ckpt["model_state"])
-        print(f"Loaded checkpoint: {checkpoint_path} (epoch={ckpt['epoch']})")
+def build_default_dialogue(character_dim: int) -> DialogueExample:
+    payload = {
+        "dialogue_id": "inline-demo",
+        "character_id": "inline-character",
+        "character_vector": [0.0] * character_dim,
+        "turns": [
+            {"speaker": "inline-character", "role": "self", "text": "I am trying to keep it together.", "turn_distance": 0},
+            {"speaker": "friend", "role": "other", "text": "You do not have to pretend with me.", "turn_distance": 1},
+            {"speaker": "inline-character", "role": "self", "text": "That actually makes me feel calmer.", "turn_distance": 1},
+        ],
+    }
+    return dialogue_from_dict(payload, character_dim=character_dim)
+
+
+def load_checkpoint(model: TextToEmotionTrajectoryModel, checkpoint_path: str) -> bool:
+    path = Path(checkpoint_path)
+    if not path.exists():
+        return False
+    checkpoint = torch.load(path, map_location="cpu")
+    model.load_state_dict(checkpoint["model_state"])
+    return True
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Run inference on a dialogue.")
+    parser.add_argument("--config", default="config.yaml", help="Path to the YAML config.")
+    parser.add_argument("--checkpoint", default="checkpoints/best.pt", help="Path to a trained checkpoint.")
+    parser.add_argument("--dialogue-path", default=None, help="Path to a single dialogue JSON file.")
+    parser.add_argument("--output-path", default=None, help="Optional JSON output path.")
+    parser.add_argument("--plot-path", default=None, help="Optional PNG output path.")
+    parser.add_argument("--sanity", action="store_true", help="Run with random weights if no checkpoint is available.")
+    args = parser.parse_args()
+
+    config = load_config(args.config)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = TextToEmotionTrajectoryModel(config)
+    checkpoint_loaded = load_checkpoint(model, args.checkpoint)
+    if not checkpoint_loaded and not args.sanity:
+        raise FileNotFoundError(
+            f"Checkpoint not found: {args.checkpoint}. "
+            "Run training first or pass `--sanity` to use random weights."
+        )
+    model = model.to(device)
+
+    if args.dialogue_path:
+        dialogue = load_dialogue_json(args.dialogue_path, character_dim=int(config["model"]["character_dim"]))
     else:
-        print("No checkpoint — using random weights (for architecture testing only)")
+        default_path = Path("sample_data/example_dialogue.json")
+        if default_path.exists():
+            dialogue = load_dialogue_json(str(default_path), character_dim=int(config["model"]["character_dim"]))
+        else:
+            dialogue = build_default_dialogue(character_dim=int(config["model"]["character_dim"]))
 
     model.eval()
-    return model
-
-
-def run_sanity_checks(model: Text2EmotionModel):
-    viz = TrajectoryVisualizer()
-    print("\n" + "="*60)
-    print("  SANITY CHECK — inspect these trajectories")
-    print("="*60)
-    texts = [s[0] for s in SANITY_CHECKS]
-    modes = [s[1] for s in SANITY_CHECKS]
     with torch.no_grad():
-        trajectories = model(texts, modes)
-    for (text, mode), traj in zip(SANITY_CHECKS, trajectories):
-        viz.print_trajectory(text=text, trajectory=traj)
+        output = model([dialogue], use_stable_history=True)[0]
 
+    visualizer = TrajectoryVisualizer()
+    visualizer.print_summary(dialogue, output)
 
-def interactive_repl(model: Text2EmotionModel):
-    viz = TrajectoryVisualizer()
-    print("\nText2Emotion REPL")
-    print("Type a sentence, optionally prefix mode: SPEAKING: I'm fine")
-    print("Type 'quit' to exit, 'sanity' to run sanity checks\n")
+    payload = output.to_dict(dialogue)
+    output_path = args.output_path or config.get("inference", {}).get("output_path")
+    if output_path:
+        destination = Path(output_path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with destination.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+        print(f"Saved JSON output to {destination.resolve()}")
 
-    while True:
-        try:
-            raw = input(">>> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            break
+    if args.plot_path:
+        visualizer.plot_dialogue(dialogue, output, save_path=args.plot_path)
+        print(f"Saved plot to {Path(args.plot_path).resolve()}")
 
-        if not raw:
-            continue
-        if raw.lower() == "quit":
-            break
-        if raw.lower() == "sanity":
-            run_sanity_checks(model)
-            continue
-
-        # Parse optional mode prefix
-        mode = "SPEAKING"
-        text = raw
-        for m in MODES:
-            if raw.upper().startswith(m + ":"):
-                mode = m
-                text = raw[len(m)+1:].strip()
-                break
-
-        with torch.no_grad():
-            traj = model([text], [mode])[0]
-        viz.print_trajectory(text=text, trajectory=traj)
+    if checkpoint_loaded:
+        print(f"Used checkpoint: {Path(args.checkpoint).resolve()}")
+    else:
+        print("Used random model weights.")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint", type=str, default=None)
-    parser.add_argument("--config",     type=str, default="configs/config.yaml")
-    parser.add_argument("--sanity",     action="store_true", help="Run sanity checks and exit")
-    parser.add_argument("--eval",       action="store_true", help="Run on eval set")
-    parser.add_argument("--eval-path",  type=str, default="data/eval_set.csv")
-    args = parser.parse_args()
-
-    model = load_model(args.checkpoint, args.config)
-
-    if args.sanity:
-        run_sanity_checks(model)
-    elif args.eval:
-        if not __import__("pathlib").Path(args.eval_path).exists():
-            print(f"Eval set not found: {args.eval_path}")
-            print("Run: python data/datasets.py  to generate template")
-        else:
-            eval_set = EvalSetDataset(args.eval_path)
-            viz = TrajectoryVisualizer()
-            with torch.no_grad():
-                for sample in eval_set:
-                    traj = model([sample.text], [sample.label.mode])[0]
-                    viz.print_trajectory(sample.text, traj, sample.label)
-    else:
-        interactive_repl(model)
+    main()

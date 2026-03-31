@@ -1,299 +1,493 @@
-"""
-datasets.py — PyTorch Dataset classes for text2emotion training.
-
-PIPELINE POSITION:
-  build_dataset.py  →  [train.csv / val.csv / eval.csv]  →  datasets.py  →  trainer.py
-
-build_dataset.py writes clause-level CSVs with schema:
-  sample_id, row_in_sample, mode, full_text, clause_text,
-  valence, arousal, playfulness, shyness, affection,
-  source, label_quality, notes
-
-This file reads those CSVs and groups them back into sample-level objects
-that the trainer and model expect.
-
-KEY DESIGN DECISION:
-  The model does its own clause segmentation internally (segmenter.py).
-  So we feed it `full_text`, NOT `clause_text`.
-  The clause-level labels from build_dataset.py are averaged back to
-  sentence level for supervision — the model learns to produce trajectories
-  that match the average label, with smoothness loss handling the temporal shape.
-
-  Why not feed clause_text directly?
-  - Single clauses produce trajectories of length 1 — no temporal signal
-  - The model's own segmenter handles boundary detection
-  - Sentence-level full_text preserves context for RoBERTa
-"""
-
 from __future__ import annotations
 
-import csv
-from dataclasses import dataclass
+import argparse
+import json
+import math
+import random
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Iterable, List, Optional
 
-import pandas as pd
-import torch
 from torch.utils.data import Dataset
 
-from models.text2emotion import INTERPRETABLE_DIMS
 
+DISCRETE_EMOTIONS = [
+    "neutral",
+    "joy",
+    "sadness",
+    "anger",
+    "fear",
+    "surprise",
+    "disgust",
+    "love",
+    "embarrassment",
+    "pride",
+    "guilt",
+    "relief",
+    "curiosity",
+    "frustration",
+]
 
-# ---------------------------------------------------------------------------
-# Label + Sample containers (unchanged — trainer depends on these)
-# ---------------------------------------------------------------------------
-
-@dataclass
-class EmotionLabel:
-    """
-    Sentence-level continuous label.
-    None = label not available for this dim (masked out in loss).
-    """
-    valence:     Optional[float] = None
-    arousal:     Optional[float] = None
-    playfulness: Optional[float] = None
-    shyness:     Optional[float] = None
-    affection:   Optional[float] = None
-    mode:        str = "SPEAKING"
-    source:      str = "unknown"
-    label_quality: str = "unknown"
-
-    def to_tensor(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Returns (label [5], mask [5]). Mask=0 where label is None."""
-        vals, mask = [], []
-        for dim in INTERPRETABLE_DIMS:
-            v = getattr(self, dim)
-            if v is not None:
-                vals.append(float(v))
-                mask.append(1.0)
-            else:
-                vals.append(0.0)
-                mask.append(0.0)
-        return torch.tensor(vals, dtype=torch.float32), \
-               torch.tensor(mask, dtype=torch.float32)
-
-    def is_weak(self) -> bool:
-        return self.label_quality in ("weak", "synthetic_llm",
-                                      "real_core_weak_aux",
-                                      "real_core_heuristic_aux")
-
-
-@dataclass
-class EmotionSample:
-    text:  str           # full_text — fed to model for segmentation
-    label: EmotionLabel
-
-
-# ---------------------------------------------------------------------------
-# Core unified loader — reads build_dataset.py output format
-# ---------------------------------------------------------------------------
-
-class UnifiedEmotionDataset(Dataset):
-    """
-    Reads train.csv / val.csv produced by build_dataset.py.
-
-    Schema expected (from build_dataset.py):
-      sample_id, row_in_sample, mode, full_text, clause_text,
-      valence, arousal, playfulness, shyness, affection,
-      source, label_quality, notes
-
-    Grouping strategy:
-      Rows with the same sample_id are grouped.
-      full_text is taken from the first clause row (they're all identical).
-      Emotion labels are averaged across clauses within the sample.
-      This gives one EmotionSample per original sentence.
-
-    label_mask_weak:
-      If True, dims from weak sources (synthetic, heuristic) are masked out
-      of the label tensor — the loss ignores them.
-      Set False only in Phase 2+ when you want weak supervision.
-    """
-
-    def __init__(self, csv_path: str, label_mask_weak: bool = False):
-        self.samples: List[EmotionSample] = []
-        self._load(csv_path, label_mask_weak)
-
-    def _load(self, path: str, label_mask_weak: bool):
-        df = pd.read_csv(path)
-        self._validate_schema(df, path)
-
-        # Clip emotion dims to [0, 1]
-        for dim in ["valence", "arousal", "playfulness", "shyness", "affection"]:
-            if dim in df.columns:
-                df[dim] = pd.to_numeric(df[dim], errors="coerce").clip(0.0, 1.0)
-
-        # Group by sample_id — each group is one sentence
-        for sample_id, group in df.groupby("sample_id", sort=False):
-            group = group.sort_values("row_in_sample")
-            first = group.iloc[0]
-
-            full_text = str(first.get("full_text", "")).strip()
-            if not full_text:
-                continue
-
-            mode          = str(first.get("mode", "SPEAKING")).strip()
-            source        = str(first.get("source", "unknown")).strip()
-            label_quality = str(first.get("label_quality", "unknown")).strip()
-            is_weak_src   = label_quality in _WEAK_SOURCES
-
-            def avg_dim(col: str) -> Optional[float]:
-                if col not in group.columns:
-                    return None
-                vals = pd.to_numeric(group[col], errors="coerce").dropna()
-                return float(vals.mean()) if len(vals) > 0 else None
-
-            label = EmotionLabel(
-                valence=     avg_dim("valence"),
-                arousal=     avg_dim("arousal"),
-                # Mask weak dims in Phase 1 if flag is set
-                playfulness= None if (label_mask_weak and is_weak_src) else avg_dim("playfulness"),
-                shyness=     None if (label_mask_weak and is_weak_src) else avg_dim("shyness"),
-                affection=   None if (label_mask_weak and is_weak_src) else avg_dim("affection"),
-                mode=mode,
-                source=source,
-                label_quality=label_quality,
-            )
-
-            self.samples.append(EmotionSample(text=full_text, label=label))
-
-    @staticmethod
-    def _validate_schema(df: pd.DataFrame, path: str):
-        required = ["sample_id", "full_text", "mode", "source", "label_quality"]
-        missing = [c for c in required if c not in df.columns]
-        if missing:
-            raise ValueError(
-                f"{Path(path).name} is missing columns: {missing}\n"
-                f"Run build_dataset.py first to generate correctly formatted CSVs."
-            )
-
-    def __len__(self): return len(self.samples)
-    def __getitem__(self, idx): return self.samples[idx]
-
-
-# Sources considered "weak" — cute dims masked in Phase 1
-_WEAK_SOURCES = {
-    "synthetic_llm", "synthetic", "weak",
-    "real_core_weak_aux", "real_core_heuristic_aux",
-}
-
-
-# ---------------------------------------------------------------------------
-# Eval set — reads build_dataset.py eval.csv OR the old hand-curated format
-# ---------------------------------------------------------------------------
-
-class EvalSetDataset(Dataset):
-    """
-    Reads eval.csv (from build_dataset.py) or the old hand-curated eval_set.csv.
-
-    Supports both schemas automatically:
-      New (build_dataset.py): sample_id, full_text, clause_text, mode, ...
-      Old (hand-curated):     text, valence, arousal, ..., mode, notes
-    """
-
-    def __init__(self, path: str):
-        self.samples: List[EmotionSample] = []
-        self.notes:   List[str] = []
-        df = pd.read_csv(path)
-
-        if "full_text" in df.columns:
-            self._load_new_format(df)
-        elif "text" in df.columns:
-            self._load_old_format(df)
-        else:
-            raise ValueError(f"Eval CSV must have 'full_text' or 'text' column: {path}")
-
-    def _load_new_format(self, df: pd.DataFrame):
-        """Grouped by sample_id, uses full_text."""
-        for _, group in df.groupby("sample_id", sort=False):
-            if "row_in_sample" in group.columns:
-                group = group.sort_values("row_in_sample")
-            first = group.iloc[0]
-            text = str(first.get("full_text", "")).strip()
-            if not text:
-                continue
-
-            def avg(col):
-                if col not in group.columns: return None
-                vals = pd.to_numeric(group[col], errors="coerce").dropna()
-                return float(vals.mean()) if len(vals) else None
-
-            self.samples.append(EmotionSample(
-                text=text,
-                label=EmotionLabel(
-                    valence=avg("valence"), arousal=avg("arousal"),
-                    playfulness=avg("playfulness"), shyness=avg("shyness"),
-                    affection=avg("affection"),
-                    mode=str(first.get("mode", "REACTING")),
-                    source=str(first.get("source", "eval")),
-                    label_quality=str(first.get("label_quality", "human")),
-                )
-            ))
-            self.notes.append(str(first.get("notes", "")))
-
-    def _load_old_format(self, df: pd.DataFrame):
-        """Old hand-curated format: one row per sentence, 'text' column."""
-        def _f(v):
-            try: return float(v)
-            except: return None
-
-        for _, row in df.iterrows():
-            text = str(row.get("text", "")).strip()
-            if not text:
-                continue
-            self.samples.append(EmotionSample(
-                text=text,
-                label=EmotionLabel(
-                    valence=     _f(row.get("valence")),
-                    arousal=     _f(row.get("arousal")),
-                    playfulness= _f(row.get("playfulness")),
-                    shyness=     _f(row.get("shyness")),
-                    affection=   _f(row.get("affection")),
-                    mode=str(row.get("mode", "SPEAKING")),
-                    source="eval",
-                    label_quality="human",
-                )
-            ))
-            self.notes.append(str(row.get("notes", "")))
-
-    def __len__(self): return len(self.samples)
-    def __getitem__(self, idx): return self.samples[idx]
-
-
-# ---------------------------------------------------------------------------
-# Eval set template generator
-# ---------------------------------------------------------------------------
-
-EVAL_TEMPLATE_ROWS = [
-    ("hehe, no way",                        0.75, 0.60, 0.90, 0.20, 0.30, "SPEAKING", "playful denial"),
-    ("uh... thanks",                        0.60, 0.30, 0.10, 0.70, 0.60, "REACTING", "shy gratitude"),
-    ("wait WHAT??",                         0.50, 0.95, 0.10, 0.10, 0.00, "REACTING", "pure surprise"),
-    ("that's fine, really",                 0.30, 0.20, 0.10, 0.20, 0.20, "SPEAKING", "suppressed negative"),
-    ("you actually did that for me?",       0.80, 0.60, 0.20, 0.40, 0.85, "REACTING", "touched, rising affection"),
-    ("...oh",                               0.20, 0.15, 0.00, 0.30, 0.10, "REACTING", "quiet realization"),
-    ("stoooop you're embarrassing me",      0.70, 0.65, 0.50, 0.80, 0.50, "SPEAKING", "flustered, playful"),
-    ("I knew it!! I knew it!!",             0.85, 0.90, 0.70, 0.05, 0.10, "SPEAKING", "excited vindication"),
-    ("oh. okay.",                           0.25, 0.15, 0.05, 0.10, 0.10, "REACTING", "quiet disappointment"),
-    ("noooo that's so cute!!",              0.90, 0.80, 0.70, 0.20, 0.60, "REACTING", "delighted"),
-    ("hmm... I'm not sure",                 0.45, 0.35, 0.10, 0.30, 0.10, "THINKING", "uncertain, mild"),
-    ("whatever, I don't care",              0.30, 0.25, 0.15, 0.05, 0.05, "SPEAKING", "dismissive"),
-    ("are you... serious right now",        0.35, 0.60, 0.20, 0.10, 0.10, "REACTING", "disbelief, mild annoyance"),
-    ("ehehe, maybe~",                       0.80, 0.55, 0.85, 0.40, 0.30, "SPEAKING", "coy, teasing"),
-    ("I was so scared but also... excited?",0.60, 0.75, 0.30, 0.40, 0.20, "SPEAKING", "mixed, complex"),
+APPRAISAL_NAMES = [
+    "goal_conduciveness",
+    "novelty",
+    "certainty",
+    "coping",
+    "social_connection",
 ]
 
 
-def generate_eval_template(output_path: str = "data/eval_set.csv"):
-    """Run once to scaffold the hand-curated eval set. Fill in scores manually."""
-    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-    with open(output_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["text", "valence", "arousal", "playfulness",
-                         "shyness", "affection", "mode", "notes"])
-        for row in EVAL_TEMPLATE_ROWS:
-            writer.writerow(row)
-    print(f"Eval template written to {output_path}")
-    print("Adjust scores to match your intuition, then run: build_dataset.py --eval-set data/eval_set.csv")
+@dataclass
+class TurnLabels:
+    vad: Optional[List[float]] = None
+    appraisal: Optional[List[float]] = None
+    discrete: Optional[int] = None
+
+
+@dataclass
+class DialogueTurn:
+    speaker: str
+    role: str
+    text: str
+    turn_distance: int
+    labels: TurnLabels = field(default_factory=TurnLabels)
+
+
+@dataclass
+class DialogueExample:
+    dialogue_id: str
+    character_id: str
+    character_vector: List[float]
+    turns: List[DialogueTurn]
+
+
+def _normalize_vector(vector: Iterable[float], dim: int) -> List[float]:
+    values = [float(v) for v in vector]
+    if len(values) >= dim:
+        return values[:dim]
+    return values + [0.0] * (dim - len(values))
+
+
+def dialogue_from_dict(payload: dict[str, Any], character_dim: int = 64) -> DialogueExample:
+    turns = []
+    for index, raw_turn in enumerate(payload.get("turns", [])):
+        labels = raw_turn.get("labels", {}) or {}
+        turns.append(
+            DialogueTurn(
+                speaker=str(raw_turn.get("speaker", payload.get("character_id", "speaker"))),
+                role=str(raw_turn.get("role", "self")).lower(),
+                text=str(raw_turn.get("text", "")).strip(),
+                turn_distance=int(raw_turn.get("turn_distance", 0 if index == 0 else 1)),
+                labels=TurnLabels(
+                    vad=labels.get("vad"),
+                    appraisal=labels.get("appraisal"),
+                    discrete=labels.get("discrete"),
+                ),
+            )
+        )
+    if not turns:
+        raise ValueError("Each dialogue must contain at least one turn.")
+
+    return DialogueExample(
+        dialogue_id=str(payload.get("dialogue_id", "dialogue")),
+        character_id=str(payload.get("character_id", "character")),
+        character_vector=_normalize_vector(payload.get("character_vector", []), character_dim),
+        turns=turns,
+    )
+
+
+def dialogue_to_dict(example: DialogueExample) -> dict[str, Any]:
+    return {
+        "dialogue_id": example.dialogue_id,
+        "character_id": example.character_id,
+        "character_vector": example.character_vector,
+        "turns": [
+            {
+                "speaker": turn.speaker,
+                "role": turn.role,
+                "text": turn.text,
+                "turn_distance": turn.turn_distance,
+                "labels": {
+                    "vad": turn.labels.vad,
+                    "appraisal": turn.labels.appraisal,
+                    "discrete": turn.labels.discrete,
+                },
+            }
+            for turn in example.turns
+        ],
+    }
+
+
+class DialogueDataset(Dataset[DialogueExample]):
+    def __init__(self, path: str, character_dim: int = 64):
+        self.path = Path(path)
+        self.character_dim = character_dim
+        if not self.path.exists():
+            raise FileNotFoundError(
+                f"Dataset not found: {self.path}. "
+                "Run `python datasets.py --write-sample-data` to generate starter files."
+            )
+        self.examples = self._load()
+
+    def _load(self) -> List[DialogueExample]:
+        examples: List[DialogueExample] = []
+        with self.path.open("r", encoding="utf-8") as handle:
+            for line_number, raw_line in enumerate(handle, start=1):
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(f"Invalid JSON on line {line_number} of {self.path}") from exc
+                examples.append(dialogue_from_dict(payload, character_dim=self.character_dim))
+        if not examples:
+            raise ValueError(f"No dialogue examples were found in {self.path}")
+        return examples
+
+    def __len__(self) -> int:
+        return len(self.examples)
+
+    def __getitem__(self, index: int) -> DialogueExample:
+        return self.examples[index]
+
+
+def collate_dialogues(batch: List[DialogueExample]) -> List[DialogueExample]:
+    return batch
+
+
+def load_dialogue_json(path: str, character_dim: int = 64) -> DialogueExample:
+    with Path(path).open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    return dialogue_from_dict(payload, character_dim=character_dim)
+
+
+def save_dialogue_json(example: DialogueExample, path: str) -> None:
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with destination.open("w", encoding="utf-8") as handle:
+        json.dump(dialogue_to_dict(example), handle, indent=2)
+
+
+def _vector_from_seed(seed: int, dim: int) -> List[float]:
+    rng = random.Random(seed)
+    values = []
+    for _ in range(dim):
+        values.append(round((rng.random() * 2.0) - 1.0, 4))
+    norm = math.sqrt(sum(value * value for value in values)) or 1.0
+    return [round(value / norm, 4) for value in values]
+
+
+def _record(dialogue_id: str, character_id: str, seed: int, turns: list[dict[str, Any]], character_dim: int) -> dict[str, Any]:
+    return {
+        "dialogue_id": dialogue_id,
+        "character_id": character_id,
+        "character_vector": _vector_from_seed(seed, character_dim),
+        "turns": turns,
+    }
+
+
+def _sample_records(character_dim: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+    train = [
+        _record(
+            "train-001",
+            "ava",
+            11,
+            [
+                {
+                    "speaker": "ava",
+                    "role": "self",
+                    "text": "I cannot believe we finally shipped it.",
+                    "turn_distance": 0,
+                    "labels": {"vad": [0.75, 0.55, 0.30], "appraisal": [0.80, 0.35, 0.70, 0.60, 0.45], "discrete": 9},
+                },
+                {
+                    "speaker": "milo",
+                    "role": "other",
+                    "text": "You carried the last stretch. You should feel proud.",
+                    "turn_distance": 1,
+                    "labels": {"vad": [0.55, 0.35, 0.20], "appraisal": [0.70, 0.15, 0.80, 0.55, 0.75], "discrete": 7},
+                },
+                {
+                    "speaker": "ava",
+                    "role": "self",
+                    "text": "Honestly, I mostly feel relieved that the pressure is over.",
+                    "turn_distance": 1,
+                    "labels": {"vad": [0.45, 0.20, 0.55], "appraisal": [0.65, 0.10, 0.75, 0.80, 0.50], "discrete": 11},
+                },
+            ],
+            character_dim,
+        ),
+        _record(
+            "train-002",
+            "noah",
+            17,
+            [
+                {
+                    "speaker": "noah",
+                    "role": "self",
+                    "text": "I snapped at her in the meeting and now I feel awful.",
+                    "turn_distance": 0,
+                    "labels": {"vad": [-0.55, 0.45, -0.60], "appraisal": [-0.65, 0.30, 0.40, -0.35, -0.25], "discrete": 10},
+                },
+                {
+                    "speaker": "iris",
+                    "role": "other",
+                    "text": "You can still apologize. That matters.",
+                    "turn_distance": 1,
+                    "labels": {"vad": [0.10, -0.10, 0.20], "appraisal": [0.20, 0.10, 0.65, 0.55, 0.80], "discrete": 0},
+                },
+                {
+                    "speaker": "noah",
+                    "role": "self",
+                    "text": "Yeah. I am scared, but I want to make it right.",
+                    "turn_distance": 1,
+                    "labels": {"vad": [-0.15, 0.35, -0.10], "appraisal": [0.05, 0.20, 0.35, 0.10, 0.65], "discrete": 4},
+                },
+            ],
+            character_dim,
+        ),
+        _record(
+            "train-003",
+            "lena",
+            23,
+            [
+                {
+                    "speaker": "lena",
+                    "role": "self",
+                    "text": "Wait, what do you mean the contract vanished?",
+                    "turn_distance": 0,
+                    "labels": {"vad": [-0.25, 0.85, -0.20], "appraisal": [-0.55, 0.95, -0.30, -0.20, -0.10], "discrete": 5},
+                },
+                {
+                    "speaker": "omar",
+                    "role": "other",
+                    "text": "I am still checking, but it looks like the wrong folder got synced.",
+                    "turn_distance": 1,
+                    "labels": {"vad": [-0.05, 0.30, -0.15], "appraisal": [-0.20, 0.55, 0.10, 0.15, 0.00], "discrete": 13},
+                },
+                {
+                    "speaker": "lena",
+                    "role": "self",
+                    "text": "That is so frustrating. We needed it today.",
+                    "turn_distance": 1,
+                    "labels": {"vad": [-0.60, 0.70, -0.30], "appraisal": [-0.75, 0.40, 0.20, -0.45, -0.15], "discrete": 13},
+                },
+            ],
+            character_dim,
+        ),
+        _record(
+            "train-004",
+            "sora",
+            29,
+            [
+                {
+                    "speaker": "sora",
+                    "role": "self",
+                    "text": "I thought I would be excited, but I just feel heavy.",
+                    "turn_distance": 0,
+                    "labels": {"vad": [-0.70, -0.35, -0.40], "appraisal": [-0.60, 0.20, 0.30, -0.30, -0.10], "discrete": 2},
+                },
+                {
+                    "speaker": "jin",
+                    "role": "other",
+                    "text": "Do you want me to stay with you for a while?",
+                    "turn_distance": 1,
+                    "labels": {"vad": [0.20, -0.20, 0.40], "appraisal": [0.35, 0.10, 0.80, 0.55, 0.95], "discrete": 7},
+                },
+                {
+                    "speaker": "sora",
+                    "role": "self",
+                    "text": "Yeah. That would help more than you know.",
+                    "turn_distance": 1,
+                    "labels": {"vad": [0.05, -0.30, 0.60], "appraisal": [0.45, 0.05, 0.70, 0.65, 0.90], "discrete": 7},
+                },
+            ],
+            character_dim,
+        ),
+        _record(
+            "train-005",
+            "mina",
+            31,
+            [
+                {
+                    "speaker": "mina",
+                    "role": "self",
+                    "text": "He remembered my favorite tea. That was unexpectedly sweet.",
+                    "turn_distance": 0,
+                    "labels": {"vad": [0.55, 0.20, 0.80], "appraisal": [0.70, 0.35, 0.60, 0.50, 0.95], "discrete": 7},
+                },
+                {
+                    "speaker": "zoe",
+                    "role": "other",
+                    "text": "You are blushing right now.",
+                    "turn_distance": 1,
+                    "labels": {"vad": [0.20, 0.45, 0.65], "appraisal": [0.40, 0.50, 0.35, 0.25, 0.70], "discrete": 8},
+                },
+                {
+                    "speaker": "mina",
+                    "role": "self",
+                    "text": "Please do not make me talk about it.",
+                    "turn_distance": 1,
+                    "labels": {"vad": [0.10, 0.35, 0.35], "appraisal": [0.10, 0.15, 0.45, 0.20, 0.55], "discrete": 8},
+                },
+            ],
+            character_dim,
+        ),
+        _record(
+            "train-006",
+            "rae",
+            37,
+            [
+                {
+                    "speaker": "rae",
+                    "role": "self",
+                    "text": "Huh. I did not expect the prototype to move that smoothly.",
+                    "turn_distance": 0,
+                    "labels": {"vad": [0.30, 0.55, 0.10], "appraisal": [0.55, 0.90, 0.35, 0.45, 0.20], "discrete": 12},
+                },
+                {
+                    "speaker": "eli",
+                    "role": "other",
+                    "text": "Do you want to take it apart and see why it worked?",
+                    "turn_distance": 1,
+                    "labels": {"vad": [0.25, 0.40, 0.05], "appraisal": [0.45, 0.65, 0.40, 0.55, 0.10], "discrete": 12},
+                },
+                {
+                    "speaker": "rae",
+                    "role": "self",
+                    "text": "Absolutely. Now I really want to know what changed.",
+                    "turn_distance": 1,
+                    "labels": {"vad": [0.55, 0.60, 0.05], "appraisal": [0.65, 0.55, 0.35, 0.70, 0.15], "discrete": 12},
+                },
+            ],
+            character_dim,
+        ),
+    ]
+
+    val = [
+        _record(
+            "val-001",
+            "hara",
+            41,
+            [
+                {
+                    "speaker": "hara",
+                    "role": "self",
+                    "text": "I was sure they would laugh at me.",
+                    "turn_distance": 0,
+                    "labels": {"vad": [-0.35, 0.50, 0.10], "appraisal": [-0.20, 0.35, 0.10, -0.25, 0.10], "discrete": 8},
+                },
+                {
+                    "speaker": "niko",
+                    "role": "other",
+                    "text": "They did not. They were impressed.",
+                    "turn_distance": 1,
+                    "labels": {"vad": [0.30, 0.20, 0.15], "appraisal": [0.55, 0.20, 0.75, 0.55, 0.50], "discrete": 9},
+                },
+                {
+                    "speaker": "hara",
+                    "role": "self",
+                    "text": "I know. It still feels unreal.",
+                    "turn_distance": 1,
+                    "labels": {"vad": [0.20, 0.20, 0.10], "appraisal": [0.45, 0.55, 0.30, 0.35, 0.30], "discrete": 5},
+                },
+            ],
+            character_dim,
+        ),
+        _record(
+            "val-002",
+            "tess",
+            43,
+            [
+                {
+                    "speaker": "tess",
+                    "role": "self",
+                    "text": "I am trying to stay calm, but I am angry.",
+                    "turn_distance": 0,
+                    "labels": {"vad": [-0.45, 0.55, -0.15], "appraisal": [-0.65, 0.20, 0.70, -0.20, -0.15], "discrete": 3},
+                },
+                {
+                    "speaker": "leo",
+                    "role": "other",
+                    "text": "Take a breath. Tell me exactly what happened.",
+                    "turn_distance": 1,
+                    "labels": {"vad": [0.05, -0.10, 0.10], "appraisal": [0.15, 0.15, 0.80, 0.65, 0.35], "discrete": 0},
+                },
+                {
+                    "speaker": "tess",
+                    "role": "self",
+                    "text": "Okay. If I explain it slowly, maybe I will stop shaking.",
+                    "turn_distance": 1,
+                    "labels": {"vad": [-0.10, 0.20, -0.05], "appraisal": [0.10, 0.25, 0.60, 0.35, 0.25], "discrete": 4},
+                },
+            ],
+            character_dim,
+        ),
+    ]
+
+    example_dialogue = _record(
+        "demo-001",
+        "demo_character",
+        101,
+        [
+            {
+                "speaker": "demo_character",
+                "role": "self",
+                "text": "I thought this presentation would go badly.",
+                "turn_distance": 0,
+                "labels": {"vad": [-0.20, 0.40, -0.05], "appraisal": [0.00, 0.25, 0.30, 0.20, 0.15], "discrete": 4},
+            },
+            {
+                "speaker": "colleague",
+                "role": "other",
+                "text": "You looked steady from the outside.",
+                "turn_distance": 1,
+                "labels": {"vad": [0.15, -0.10, 0.10], "appraisal": [0.25, 0.15, 0.75, 0.50, 0.45], "discrete": 0},
+            },
+            {
+                "speaker": "demo_character",
+                "role": "self",
+                "text": "Hearing that actually makes me feel relieved.",
+                "turn_distance": 1,
+                "labels": {"vad": [0.45, 0.10, 0.35], "appraisal": [0.60, 0.10, 0.80, 0.70, 0.60], "discrete": 11},
+            },
+        ],
+        character_dim,
+    )
+    return train, val, example_dialogue
+
+
+def write_sample_data(output_dir: str = "sample_data", character_dim: int = 64) -> None:
+    root = Path(output_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    train_records, val_records, example_dialogue = _sample_records(character_dim)
+
+    with (root / "train.jsonl").open("w", encoding="utf-8") as handle:
+        for record in train_records:
+            handle.write(json.dumps(record, ensure_ascii=True) + "\n")
+
+    with (root / "val.jsonl").open("w", encoding="utf-8") as handle:
+        for record in val_records:
+            handle.write(json.dumps(record, ensure_ascii=True) + "\n")
+
+    with (root / "example_dialogue.json").open("w", encoding="utf-8") as handle:
+        json.dump(example_dialogue, handle, indent=2, ensure_ascii=True)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Dialogue dataset utilities.")
+    parser.add_argument("--write-sample-data", action="store_true", help="Create starter train/val/demo files.")
+    parser.add_argument("--output-dir", default="sample_data", help="Destination directory for generated files.")
+    parser.add_argument("--character-dim", type=int, default=64, help="Dimension of the generated character vectors.")
+    args = parser.parse_args()
+
+    if args.write_sample_data:
+        write_sample_data(output_dir=args.output_dir, character_dim=args.character_dim)
+        print(f"Wrote sample data to {Path(args.output_dir).resolve()}")
+    else:
+        parser.print_help()
 
 
 if __name__ == "__main__":
-    generate_eval_template()
+    main()
