@@ -24,9 +24,9 @@ def build_default_dialogue(character_dim: int) -> DialogueExample:
         "character_id": "inline-character",
         "character_vector": [0.0] * character_dim,
         "turns": [
-            {"speaker": "inline-character", "role": "self", "text": "I am trying to keep it together.", "turn_distance": 0},
-            {"speaker": "friend", "role": "other", "text": "You do not have to pretend with me.", "turn_distance": 1},
-            {"speaker": "inline-character", "role": "self", "text": "That actually makes me feel calmer.", "turn_distance": 1},
+            {"role": "self", "text": "I am trying to keep it together.", "turn_distance": 0},
+            {"role": "other", "text": "You do not have to pretend with me.", "turn_distance": 1},
+            {"role": "self", "text": "That actually makes me feel calmer.", "turn_distance": 1},
         ],
     }
     return dialogue_from_dict(payload, character_dim=character_dim)

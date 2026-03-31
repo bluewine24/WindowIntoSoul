@@ -1,0 +1,74 @@
+character_vectors:
+  dim: 32
+  strategy: dataset_character
+  seed: 42
+
+turn_distance:
+  max_value: 15
+
+splits:
+  train: 0.8
+  val: 0.1
+  test: 0.1
+  seed: 42
+
+output:
+  dir: processed_data
+  train_file: train.jsonl
+  val_file: val.jsonl
+  test_file: test.jsonl
+  stats_file: stats.json
+
+datasets:
+  - name: goemotions
+    adapter: single_turn_table
+    format: csv
+    path: raw/goemotions.csv
+    text_field: text
+    dialogue_field: id
+    character_field: author_id
+    discrete_field: labels
+    discrete_map: goemotions
+    multi_label_policy: first_supported
+
+  - name: emobank
+    adapter: single_turn_table
+    format: csv
+    path: raw/emobank.csv
+    text_field: text
+    dialogue_field: id
+    vad_fields: [v, a, d]
+    vad_range: [1.0, 5.0]
+
+  - name: meld
+    adapter: dialogue_table
+    format: csv
+    path: raw/meld_train.csv
+    dialogue_field: Dialogue_ID
+    turn_field: Utterance_ID
+    speaker_field: Speaker
+    text_field: Utterance
+    discrete_field: Emotion
+    discrete_map: meld
+
+  - name: dailydialog
+    adapter: dialogue_jsonl
+    format: jsonl
+    path: raw/dailydialog.jsonl
+    dialogue_field: dialogue_id
+    turns_field: turns
+    speaker_field: speaker
+    text_field: text
+    discrete_field: emotion
+    discrete_map: dailydialog
+
+  - name: empatheticdialogues
+    adapter: dialogue_table
+    format: csv
+    path: raw/empatheticdialogues.csv
+    dialogue_field: conv_id
+    turn_field: utterance_idx
+    speaker_field: speaker_idx
+    text_field: utterance
+    discrete_field: emotion
+    discrete_map: empatheticdialogues

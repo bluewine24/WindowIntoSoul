@@ -15,7 +15,7 @@ class TrajectoryVisualizer:
         predicted = torch.argmax(probabilities, dim=-1)
         print(f"Dialogue: {dialogue.dialogue_id} | Character: {dialogue.character_id}")
         for index, turn in enumerate(dialogue.turns):
-            print(f"[{index}] {turn.speaker} ({turn.role})")
+            print(f"[{index}] role={turn.role}")
             print(f"    text: {turn.text}")
             print(
                 "    emotion:"
@@ -54,7 +54,7 @@ class TrajectoryVisualizer:
         axes[2].legend(loc="upper right")
         axes[2].grid(True, alpha=0.3)
 
-        labels = [f"{turn.speaker}\n{turn.text[:36]}" for turn in dialogue.turns]
+        labels = [f"{turn.role}\n{turn.text[:36]}" for turn in dialogue.turns]
         axes[2].set_xticks(turns)
         axes[2].set_xticklabels(labels, rotation=15, ha="right")
 

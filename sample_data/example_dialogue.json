@@ -69,7 +69,6 @@
   ],
   "turns": [
     {
-      "speaker": "demo_character",
       "role": "self",
       "text": "I thought this presentation would go badly.",
       "turn_distance": 0,
@@ -90,7 +89,6 @@
       }
     },
     {
-      "speaker": "colleague",
       "role": "other",
       "text": "You looked steady from the outside.",
       "turn_distance": 1,
@@ -111,7 +109,6 @@
       }
     },
     {
-      "speaker": "demo_character",
       "role": "self",
       "text": "Hearing that actually makes me feel relieved.",
       "turn_distance": 1,

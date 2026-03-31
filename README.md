@@ -96,6 +96,16 @@ basic_env\Scripts\python.exe inference.py --dialogue-path sample_data/example_di
 This prints a per-turn summary, writes JSON output, and optionally saves a
 trajectory plot.
 
+### 5. Build a unified training corpus
+
+```powershell
+basic_env\Scripts\python.exe preprocess_datasets.py --config preprocess_recipe.yaml
+```
+
+This converts raw source datasets into the unified target-character schema,
+creates one sample per target character per dialogue, normalizes available
+labels, and writes dialogue-level train/val/test splits to `processed_data/`.
+
 ## Data Format
 
 Training and validation files are JSONL. Each line is one dialogue with a
@@ -110,7 +120,6 @@ Example:
   "character_vector": [0.12, -0.03, 0.44],
   "turns": [
     {
-      "speaker": "ava",
       "role": "self",
       "text": "I cannot believe we finally shipped it.",
       "turn_distance": 0,
@@ -127,12 +136,22 @@ Example:
 Fields:
 
 - `character_vector`: fixed persona embedding for the target character
-- `role`: speaker role relative to the target character, currently `self`,
-  `other`, or `narrator`
+- `role`: role relative to the target character, currently `self`, `other`,
+  or `narrator`
 - `turn_distance`: simple recency feature bucketed by the model
 - `vad`: valence, arousal, dominance
-- `appraisal`: five interpretable appraisal values
+- `appraisal`: five aligned appraisal values in this order:
+  `coping`, `goal_relevance`, `novelty`, `pleasantness`, `norm_fit`
 - `discrete`: integer class id from the 14-class discrete label set
+
+The dataset intentionally does not store raw speaker names. The model only uses
+`role` (`self` or `other`) because names alone do not provide useful emotional
+signal here. If relationship modeling becomes important later, speaker identity
+can come back as a learned `speaker_embedding`, not as raw text names.
+
+For multi-speaker conversations, preprocessing creates one training sample per
+target character per dialogue. The target character's own turns become
+`role=self`, and all other turns become `role=other`.
 
 ## How The Model Works
 
@@ -149,8 +168,8 @@ This gives one dense embedding per utterance.
 
 ### 2. Role conditioning
 
-Each turn's speaker role is embedded and concatenated with the text embedding.
-That merged vector is projected into `utterance_embedding`.
+Each turn's role is embedded and concatenated with the text embedding. That
+merged vector is projected into `utterance_embedding`.
 
 This happens in:
 
@@ -275,6 +294,15 @@ scaled by `joint_gate_scale`.
 - loads JSONL files into Python dataclasses
 - provides `write_sample_data()` to create a runnable starter dataset
 
+### `preprocess_datasets.py`
+
+- converts raw single-turn or dialogue datasets into the unified schema
+- maps source labels into the shared 14-class discrete space
+- scales VAD into a common range and preserves sparse appraisal labels with
+  null masks
+- creates one sample per target character per dialogue
+- splits by dialogue id to avoid train/val/test leakage
+
 ### `text2emotion.py`
 
 - defines the full model
@@ -356,6 +384,7 @@ If you want to keep developing this project, the highest-value next steps are:
 
 1. Replace the sample dataset with real dialogue emotion annotations.
 2. Add a proper experiment/evaluation loop with held-out metrics by task.
-3. Expand the memory features with speaker identity and absolute turn indices.
+3. Reintroduce speaker identity only as a learned `speaker_embedding` if you
+   need relationship-aware modeling.
 4. Add a downstream decoder from `z_stable` to facial action units or rig
    controls.

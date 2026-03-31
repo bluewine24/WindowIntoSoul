@@ -60,15 +60,38 @@ class EmotionTrajectoryLoss(nn.Module):
                 vad_targets.append([0.0, 0.0, 0.0])
                 vad_mask.append([0.0, 0.0, 0.0])
             else:
-                vad_targets.append([float(v) for v in turn.labels.vad])
-                vad_mask.append([1.0, 1.0, 1.0])
+                current_vad_targets = []
+                current_vad_mask = []
+                for value in turn.labels.vad:
+                    if value is None:
+                        current_vad_targets.append(0.0)
+                        current_vad_mask.append(0.0)
+                    else:
+                        current_vad_targets.append(float(value))
+                        current_vad_mask.append(1.0)
+                vad_targets.append(current_vad_targets)
+                vad_mask.append(current_vad_mask)
 
             if turn.labels.appraisal is None:
                 appraisal_targets.append([0.0] * 5)
                 appraisal_mask.append([0.0] * 5)
             else:
-                appraisal_targets.append([float(v) for v in turn.labels.appraisal])
-                appraisal_mask.append([1.0] * len(turn.labels.appraisal))
+                current_appraisal_targets = []
+                current_appraisal_mask = []
+                for value in turn.labels.appraisal:
+                    if value is None:
+                        current_appraisal_targets.append(0.0)
+                        current_appraisal_mask.append(0.0)
+                    else:
+                        current_appraisal_targets.append(float(value))
+                        current_appraisal_mask.append(1.0)
+                if len(current_appraisal_targets) != 5:
+                    raise ValueError(
+                        f"Appraisal labels must contain 5 values or null placeholders, got {len(current_appraisal_targets)} "
+                        f"for dialogue {example.dialogue_id}"
+                    )
+                appraisal_targets.append(current_appraisal_targets)
+                appraisal_mask.append(current_appraisal_mask)
 
             if turn.labels.discrete is None:
                 discrete_targets.append(0)

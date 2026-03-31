@@ -29,24 +29,23 @@ DISCRETE_EMOTIONS = [
 ]
 
 APPRAISAL_NAMES = [
-    "goal_conduciveness",
-    "novelty",
-    "certainty",
     "coping",
-    "social_connection",
+    "goal_relevance",
+    "novelty",
+    "pleasantness",
+    "norm_fit",
 ]
 
 
 @dataclass
 class TurnLabels:
-    vad: Optional[List[float]] = None
-    appraisal: Optional[List[float]] = None
+    vad: Optional[List[Optional[float]]] = None
+    appraisal: Optional[List[Optional[float]]] = None
     discrete: Optional[int] = None
 
 
 @dataclass
 class DialogueTurn:
-    speaker: str
     role: str
     text: str
     turn_distance: int
@@ -74,7 +73,6 @@ def dialogue_from_dict(payload: dict[str, Any], character_dim: int = 64) -> Dial
         labels = raw_turn.get("labels", {}) or {}
         turns.append(
             DialogueTurn(
-                speaker=str(raw_turn.get("speaker", payload.get("character_id", "speaker"))),
                 role=str(raw_turn.get("role", "self")).lower(),
                 text=str(raw_turn.get("text", "")).strip(),
                 turn_distance=int(raw_turn.get("turn_distance", 0 if index == 0 else 1)),
@@ -103,7 +101,6 @@ def dialogue_to_dict(example: DialogueExample) -> dict[str, Any]:
         "character_vector": example.character_vector,
         "turns": [
             {
-                "speaker": turn.speaker,
                 "role": turn.role,
                 "text": turn.text,
                 "turn_distance": turn.turn_distance,
@@ -195,21 +192,18 @@ def _sample_records(character_dim: int) -> tuple[list[dict[str, Any]], list[dict
             11,
             [
                 {
-                    "speaker": "ava",
                     "role": "self",
                     "text": "I cannot believe we finally shipped it.",
                     "turn_distance": 0,
                     "labels": {"vad": [0.75, 0.55, 0.30], "appraisal": [0.80, 0.35, 0.70, 0.60, 0.45], "discrete": 9},
                 },
                 {
-                    "speaker": "milo",
                     "role": "other",
                     "text": "You carried the last stretch. You should feel proud.",
                     "turn_distance": 1,
                     "labels": {"vad": [0.55, 0.35, 0.20], "appraisal": [0.70, 0.15, 0.80, 0.55, 0.75], "discrete": 7},
                 },
                 {
-                    "speaker": "ava",
                     "role": "self",
                     "text": "Honestly, I mostly feel relieved that the pressure is over.",
                     "turn_distance": 1,
@@ -224,21 +218,18 @@ def _sample_records(character_dim: int) -> tuple[list[dict[str, Any]], list[dict
             17,
             [
                 {
-                    "speaker": "noah",
                     "role": "self",
                     "text": "I snapped at her in the meeting and now I feel awful.",
                     "turn_distance": 0,
                     "labels": {"vad": [-0.55, 0.45, -0.60], "appraisal": [-0.65, 0.30, 0.40, -0.35, -0.25], "discrete": 10},
                 },
                 {
-                    "speaker": "iris",
                     "role": "other",
                     "text": "You can still apologize. That matters.",
                     "turn_distance": 1,
                     "labels": {"vad": [0.10, -0.10, 0.20], "appraisal": [0.20, 0.10, 0.65, 0.55, 0.80], "discrete": 0},
                 },
                 {
-                    "speaker": "noah",
                     "role": "self",
                     "text": "Yeah. I am scared, but I want to make it right.",
                     "turn_distance": 1,
@@ -253,21 +244,18 @@ def _sample_records(character_dim: int) -> tuple[list[dict[str, Any]], list[dict
             23,
             [
                 {
-                    "speaker": "lena",
                     "role": "self",
                     "text": "Wait, what do you mean the contract vanished?",
                     "turn_distance": 0,
                     "labels": {"vad": [-0.25, 0.85, -0.20], "appraisal": [-0.55, 0.95, -0.30, -0.20, -0.10], "discrete": 5},
                 },
                 {
-                    "speaker": "omar",
                     "role": "other",
                     "text": "I am still checking, but it looks like the wrong folder got synced.",
                     "turn_distance": 1,
                     "labels": {"vad": [-0.05, 0.30, -0.15], "appraisal": [-0.20, 0.55, 0.10, 0.15, 0.00], "discrete": 13},
                 },
                 {
-                    "speaker": "lena",
                     "role": "self",
                     "text": "That is so frustrating. We needed it today.",
                     "turn_distance": 1,
@@ -282,21 +270,18 @@ def _sample_records(character_dim: int) -> tuple[list[dict[str, Any]], list[dict
             29,
             [
                 {
-                    "speaker": "sora",
                     "role": "self",
                     "text": "I thought I would be excited, but I just feel heavy.",
                     "turn_distance": 0,
                     "labels": {"vad": [-0.70, -0.35, -0.40], "appraisal": [-0.60, 0.20, 0.30, -0.30, -0.10], "discrete": 2},
                 },
                 {
-                    "speaker": "jin",
                     "role": "other",
                     "text": "Do you want me to stay with you for a while?",
                     "turn_distance": 1,
                     "labels": {"vad": [0.20, -0.20, 0.40], "appraisal": [0.35, 0.10, 0.80, 0.55, 0.95], "discrete": 7},
                 },
                 {
-                    "speaker": "sora",
                     "role": "self",
                     "text": "Yeah. That would help more than you know.",
                     "turn_distance": 1,
@@ -311,21 +296,18 @@ def _sample_records(character_dim: int) -> tuple[list[dict[str, Any]], list[dict
             31,
             [
                 {
-                    "speaker": "mina",
                     "role": "self",
                     "text": "He remembered my favorite tea. That was unexpectedly sweet.",
                     "turn_distance": 0,
                     "labels": {"vad": [0.55, 0.20, 0.80], "appraisal": [0.70, 0.35, 0.60, 0.50, 0.95], "discrete": 7},
                 },
                 {
-                    "speaker": "zoe",
                     "role": "other",
                     "text": "You are blushing right now.",
                     "turn_distance": 1,
                     "labels": {"vad": [0.20, 0.45, 0.65], "appraisal": [0.40, 0.50, 0.35, 0.25, 0.70], "discrete": 8},
                 },
                 {
-                    "speaker": "mina",
                     "role": "self",
                     "text": "Please do not make me talk about it.",
                     "turn_distance": 1,
@@ -340,21 +322,18 @@ def _sample_records(character_dim: int) -> tuple[list[dict[str, Any]], list[dict
             37,
             [
                 {
-                    "speaker": "rae",
                     "role": "self",
                     "text": "Huh. I did not expect the prototype to move that smoothly.",
                     "turn_distance": 0,
                     "labels": {"vad": [0.30, 0.55, 0.10], "appraisal": [0.55, 0.90, 0.35, 0.45, 0.20], "discrete": 12},
                 },
                 {
-                    "speaker": "eli",
                     "role": "other",
                     "text": "Do you want to take it apart and see why it worked?",
                     "turn_distance": 1,
                     "labels": {"vad": [0.25, 0.40, 0.05], "appraisal": [0.45, 0.65, 0.40, 0.55, 0.10], "discrete": 12},
                 },
                 {
-                    "speaker": "rae",
                     "role": "self",
                     "text": "Absolutely. Now I really want to know what changed.",
                     "turn_distance": 1,
@@ -372,21 +351,18 @@ def _sample_records(character_dim: int) -> tuple[list[dict[str, Any]], list[dict
             41,
             [
                 {
-                    "speaker": "hara",
                     "role": "self",
                     "text": "I was sure they would laugh at me.",
                     "turn_distance": 0,
                     "labels": {"vad": [-0.35, 0.50, 0.10], "appraisal": [-0.20, 0.35, 0.10, -0.25, 0.10], "discrete": 8},
                 },
                 {
-                    "speaker": "niko",
                     "role": "other",
                     "text": "They did not. They were impressed.",
                     "turn_distance": 1,
                     "labels": {"vad": [0.30, 0.20, 0.15], "appraisal": [0.55, 0.20, 0.75, 0.55, 0.50], "discrete": 9},
                 },
                 {
-                    "speaker": "hara",
                     "role": "self",
                     "text": "I know. It still feels unreal.",
                     "turn_distance": 1,
@@ -401,21 +377,18 @@ def _sample_records(character_dim: int) -> tuple[list[dict[str, Any]], list[dict
             43,
             [
                 {
-                    "speaker": "tess",
                     "role": "self",
                     "text": "I am trying to stay calm, but I am angry.",
                     "turn_distance": 0,
                     "labels": {"vad": [-0.45, 0.55, -0.15], "appraisal": [-0.65, 0.20, 0.70, -0.20, -0.15], "discrete": 3},
                 },
                 {
-                    "speaker": "leo",
                     "role": "other",
                     "text": "Take a breath. Tell me exactly what happened.",
                     "turn_distance": 1,
                     "labels": {"vad": [0.05, -0.10, 0.10], "appraisal": [0.15, 0.15, 0.80, 0.65, 0.35], "discrete": 0},
                 },
                 {
-                    "speaker": "tess",
                     "role": "self",
                     "text": "Okay. If I explain it slowly, maybe I will stop shaking.",
                     "turn_distance": 1,
@@ -432,21 +405,18 @@ def _sample_records(character_dim: int) -> tuple[list[dict[str, Any]], list[dict
         101,
         [
             {
-                "speaker": "demo_character",
                 "role": "self",
                 "text": "I thought this presentation would go badly.",
                 "turn_distance": 0,
                 "labels": {"vad": [-0.20, 0.40, -0.05], "appraisal": [0.00, 0.25, 0.30, 0.20, 0.15], "discrete": 4},
             },
             {
-                "speaker": "colleague",
                 "role": "other",
                 "text": "You looked steady from the outside.",
                 "turn_distance": 1,
                 "labels": {"vad": [0.15, -0.10, 0.10], "appraisal": [0.25, 0.15, 0.75, 0.50, 0.45], "discrete": 0},
             },
             {
-                "speaker": "demo_character",
                 "role": "self",
                 "text": "Hearing that actually makes me feel relieved.",
                 "turn_distance": 1,

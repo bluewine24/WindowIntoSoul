@@ -198,7 +198,6 @@ class DialogueEmotionOutput:
             turns.append(
                 {
                     "index": index,
-                    "speaker": turn.speaker,
                     "role": turn.role,
                     "text": turn.text,
                     "gate": float(self.gates[index].item()),
