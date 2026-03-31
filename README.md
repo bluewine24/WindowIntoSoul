@@ -1,89 +1,144 @@
-# text2emotion
+# Text-to-Emotion Trajectory Model
 
-A **text → emotion trajectory** model for AI avatar face control.
+A dialogue-aware emotion modeling system that produces a continuous
+emotional state (`z_emotion`) from text, with temporal consistency and
+character conditioning. Designed for downstream control of face/rig
+animation.
+
+---
+
+## Overview
+
+This model maps conversational input into a **latent emotional
+trajectory** rather than isolated labels.
+
+Key properties:
+
+- maintains emotional state across turns\
+- conditions on character/persona\
+- uses dialogue context (who said what, when)\
+- produces a compact latent (`z`) for animation control\
+- uses interpretable supervision during training (VAD, appraisal,
+  discrete)\
+- applies a learned inertia gate at inference for stable expression
+
+---
 
 ## Architecture
 
-```
-text + mode
-  → RoBERTa-base  (frozen → partial unfreeze)
-  → clause attention pooling
-  → 2-layer GRU  (hidden=256)
-  → interpretable head  [M × 5]  valence/arousal/playfulness/shyness/affection
-  → latent head         [M × 8]  free structure
-  → output              [M × 13] clause-level emotion trajectory
-```
+### 1. Utterance Encoding
 
-## Quick Start
+RoBERTa-base (frozen)\
+→ attention pooling → text_embedding (768)
 
-```bash
-pip install -r requirements.txt
+text_embedding ⊕ role_embedding\
+→ Linear → utterance_embedding (768)
 
-# 1. Generate eval set template (fill in manually before training)
-python data/datasets.py
+---
 
-# 2. Test architecture with random weights
-python inference.py --sanity
+### 2. Character Conditioning
 
-# 3. Train
-python training/trainer.py
+character_vector\
+→ MLP → h_0 (initial GRU hidden state)\
+→ MLP → char_step (appended at every timestep)\
+→ prepended to context_buffer
 
-# 4. Interactive REPL
-python inference.py --checkpoint checkpoints/model_best.pt
+---
 
-# 5. Visualize eval set
-python inference.py --checkpoint checkpoints/model_best.pt --eval
-```
+### 3. Context Buffer (Memory)
 
-## Training Phases
+memory_t = \[\
+utterance_embedding ;\
+role_embedding ;\
+z_stable\* ;\
+turn_distance_embedding\
+\]
 
-| Phase | Dims active | Data | Goal |
-|-------|-------------|------|------|
-| 1 | valence, arousal | EmoBank | Stable backbone + GRU |
-| 2 | + playfulness, shyness, affection | + synthetic (weak) | Cute dims |
-| 3 | all | both | Visualize + iterate |
-| 4 | all | both | Unfreeze top RoBERTa layers |
+- sliding window over last N turns\
 
-## First Milestone
+- includes both semantic and emotional history
 
-Before touching the face decoder, the model must pass this manually:
+- uses:
 
-```
-"hehe, no way"         → playfulness high, arousal moderate
-"uh... thanks"         → shyness + affection, low arousal  
-"wait WHAT??"          → arousal spike
-"that's fine, really"  → suppressed valence, flat
-"...oh"                → low arousal, valence drop
-```
+- `z_emotion` during training\
 
-## Project Structure
+- `z_stable` during inference
 
-```
-text2emotion/
-├── configs/config.yaml          ← all hyperparameters
-├── models/
-│   ├── text2emotion.py          ← main model
-│   └── segmenter.py             ← swappable clause segmenter
-├── training/
-│   ├── trainer.py               ← phase-aware training loop
-│   └── losses.py                ← combined loss with dim-aware smoothness
-├── data/
-│   └── datasets.py              ← EmoBank, synthetic, eval set loaders
-├── evaluation/
-│   └── visualizer.py            ← terminal + matplotlib trajectory plots
-├── inference.py                 ← REPL + sanity checks
-└── requirements.txt
-```
+---
 
-## Data
+### 4. Recurrent Core
 
-- **EmoBank**: https://github.com/JULIELab/EmoBank — real continuous VAD labels
-- **Synthetic**: generate with GPT-4 for playfulness/shyness/affection dims
-- **Eval set**: `data/eval_set.csv` — build this manually first, it's your compass
+cross_attention(prev_h, context_buffer) → context_vector
 
-## Next Step After This
+concat(utterance_embedding, context_vector, char_step)\
+→ GRU (2 layers, hidden=512)\
+→ h_t
 
-Once trajectories look right visually:
-- Build the face decoder: `emotion trajectory → blendshape/AU values`
-- Add spring-damper post-processing for natural transitions
-- Add procedural blink + idle motion layer
+h_t\
+→ Linear → LayerNorm → Tanh\
+→ z_emotion (128)
+
+---
+
+### 5. Interpretable Heads (Training Only)
+
+z_emotion → VAD (3) → Tanh\
+z_emotion → appraisal (5) → Tanh\
+z_emotion → discrete (14) → Softmax (auxiliary)
+
+---
+
+## Training Objectives
+
+### Losses (Training Only)
+
+- smoothness loss (label-aware, light weight)\
+- contrastive loss (discrete label + role, soft margin)\
+- consistency loss (same label + role → nearby latent, low weight)
+
+---
+
+## Inertia Gate (Temporal Stabilization)
+
+### v1 (simple)
+
+gate = sigmoid(W \* \|z_t - z_prev\| + b)
+
+### v2 (context-aware)
+
+gate = sigmoid(MLP(\[z_prev ; z_t ; \|z_t - z_prev\| ;
+context_vector\]))
+
+### Final update
+
+z_stable = gate \* z_t + (1 - gate) \* z_prev
+
+---
+
+## Output
+
+z_stable → face / rig decoder
+
+---
+
+## Training Procedure
+
+### Stage 1 --- Base Model
+
+Train GRU, projection, and heads with all losses. RoBERTa frozen.
+
+### Stage 2 --- Inertia Gate
+
+Freeze base. Train gate module.
+
+### Stage 3 --- Joint Fine-Tuning
+
+Unfreeze all. Train with small learning rate.
+
+---
+
+## Summary
+
+Emotion is modeled as a continuous, context-aware trajectory:
+
+emotion = f(text, role, character, memory, time)

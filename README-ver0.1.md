@@ -1,0 +1,89 @@
+# text2emotion
+
+A **text → emotion trajectory** model for AI avatar face control.
+
+## Architecture
+
+```
+text + mode
+  → RoBERTa-base  (frozen → partial unfreeze)
+  → clause attention pooling
+  → 2-layer GRU  (hidden=256)
+  → interpretable head  [M × 5]  valence/arousal/playfulness/shyness/affection
+  → latent head         [M × 8]  free structure
+  → output              [M × 13] clause-level emotion trajectory
+```
+
+## Quick Start
+
+```bash
+pip install -r requirements.txt
+
+# 1. Generate eval set template (fill in manually before training)
+python data/datasets.py
+
+# 2. Test architecture with random weights
+python inference.py --sanity
+
+# 3. Train
+python training/trainer.py
+
+# 4. Interactive REPL
+python inference.py --checkpoint checkpoints/model_best.pt
+
+# 5. Visualize eval set
+python inference.py --checkpoint checkpoints/model_best.pt --eval
+```
+
+## Training Phases
+
+| Phase | Dims active | Data | Goal |
+|-------|-------------|------|------|
+| 1 | valence, arousal | EmoBank | Stable backbone + GRU |
+| 2 | + playfulness, shyness, affection | + synthetic (weak) | Cute dims |
+| 3 | all | both | Visualize + iterate |
+| 4 | all | both | Unfreeze top RoBERTa layers |
+
+## First Milestone
+
+Before touching the face decoder, the model must pass this manually:
+
+```
+"hehe, no way"         → playfulness high, arousal moderate
+"uh... thanks"         → shyness + affection, low arousal  
+"wait WHAT??"          → arousal spike
+"that's fine, really"  → suppressed valence, flat
+"...oh"                → low arousal, valence drop
+```
+
+## Project Structure
+
+```
+text2emotion/
+├── configs/config.yaml          ← all hyperparameters
+├── models/
+│   ├── text2emotion.py          ← main model
+│   └── segmenter.py             ← swappable clause segmenter
+├── training/
+│   ├── trainer.py               ← phase-aware training loop
+│   └── losses.py                ← combined loss with dim-aware smoothness
+├── data/
+│   └── datasets.py              ← EmoBank, synthetic, eval set loaders
+├── evaluation/
+│   └── visualizer.py            ← terminal + matplotlib trajectory plots
+├── inference.py                 ← REPL + sanity checks
+└── requirements.txt
+```
+
+## Data
+
+- **EmoBank**: https://github.com/JULIELab/EmoBank — real continuous VAD labels
+- **Synthetic**: generate with GPT-4 for playfulness/shyness/affection dims
+- **Eval set**: `data/eval_set.csv` — build this manually first, it's your compass
+
+## Next Step After This
+
+Once trajectories look right visually:
+- Build the face decoder: `emotion trajectory → blendshape/AU values`
+- Add spring-damper post-processing for natural transitions
+- Add procedural blink + idle motion layer
