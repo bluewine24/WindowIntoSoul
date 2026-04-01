@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import csv
 import hashlib
 import json
 import math
 import random
+import re
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -65,6 +67,30 @@ COMMON_DISCRETE_LABEL_MAP = {
     "annoyance": "frustration",
     "annoyed": "frustration",
     "desire": "curiosity",
+    "afraid": "fear",
+    "anxious": "fear",
+    "terrified": "fear",
+    "apprehensive": "fear",
+    "hopeful": "joy",
+    "grateful": "relief",
+    "joyful": "joy",
+    "excited": "joy",
+    "prepared": "pride",
+    "confident": "pride",
+    "content": "joy",
+    "faithful": "love",
+    "trusting": "love",
+    "sentimental": "love",
+    "nostalgic": "sadness",
+    "lonely": "sadness",
+    "furious": "anger",
+    "disappointed": "sadness",
+    "disgusted": "disgust",
+    "embarrassed": "embarrassment",
+    "impressed": "surprise",
+    "jealous": "frustration",
+    "devastated": "sadness",
+    "caring": "love",
 }
 
 BUILTIN_LABEL_MAPS: dict[str, dict[str, str]] = {
@@ -109,6 +135,7 @@ class RawDialogue:
     dataset_name: str
     dialogue_id: str
     turns: list[RawTurn]
+    source_split: Optional[str] = None
 
 
 class CharacterVectorFactory:
@@ -132,6 +159,25 @@ class CharacterVectorFactory:
             norm = math.sqrt(sum(value * value for value in values)) or 1.0
             self._cache[key] = [round(value / norm, 6) for value in values]
         return self._cache[key]
+
+
+def _normalize_split_name(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    normalized = str(value).strip().lower()
+    split_aliases = {
+        "train": "train",
+        "training": "train",
+        "trn": "train",
+        "dev": "val",
+        "valid": "val",
+        "validation": "val",
+        "val": "val",
+        "test": "test",
+        "testing": "test",
+        "tst": "test",
+    }
+    return split_aliases.get(normalized)
 
 
 def load_recipe(path: str) -> dict[str, Any]:
@@ -172,10 +218,24 @@ def _coerce_float(value: Any) -> Optional[float]:
     return float(value)
 
 
+def _coerce_confidence(value: Any) -> Optional[float]:
+    numeric = _coerce_float(value)
+    if numeric is None:
+        return None
+    return max(0.0, min(1.0, float(numeric)))
+
+
 def _coerce_int(value: Any) -> Optional[int]:
     if value is None or value == "":
         return None
     return int(value)
+
+
+def _is_positive_label(value: Any) -> bool:
+    if value is None:
+        return False
+    normalized = str(value).strip().lower()
+    return normalized in {"1", "1.0", "true", "yes"}
 
 
 def _parse_sequence(value: Any) -> list[Any]:
@@ -313,14 +373,84 @@ def _extract_appraisal(container: dict[str, Any], spec: dict[str, Any]) -> Optio
     return aligned
 
 
+def _extract_appraisal_confidence(
+    container: dict[str, Any],
+    spec: dict[str, Any],
+    appraisal: Optional[list[Optional[float]]],
+) -> Optional[list[Optional[float]]]:
+    if appraisal is None:
+        return None
+
+    values: dict[str, Optional[float]] = {}
+
+    if spec.get("appraisal_confidence_field"):
+        confidence_payload = container.get(spec["appraisal_confidence_field"])
+        if isinstance(confidence_payload, dict):
+            values = {name: _coerce_confidence(confidence_payload.get(name)) for name in APPRAISAL_NAMES}
+        else:
+            sequence = [_coerce_confidence(value) for value in _parse_sequence(confidence_payload)]
+            if len(sequence) not in {0, len(APPRAISAL_NAMES)}:
+                raise ValueError(f"Appraisal confidence requires {len(APPRAISAL_NAMES)} values, got {sequence}")
+            values = {name: sequence[index] for index, name in enumerate(APPRAISAL_NAMES)} if sequence else {}
+    else:
+        field_map = spec.get("appraisal_confidence_fields", {}) or {}
+        nested_labels = container.get("labels") if isinstance(container.get("labels"), dict) else {}
+        nested_appraisal = container.get("appraisal") if isinstance(container.get("appraisal"), dict) else {}
+        nested_confidence = (
+            container.get("appraisal_confidence") if isinstance(container.get("appraisal_confidence"), dict) else {}
+        )
+        for target_name in APPRAISAL_NAMES:
+            raw_field = field_map.get(target_name)
+            if raw_field and raw_field in container:
+                values[target_name] = _coerce_confidence(container.get(raw_field))
+            elif raw_field and raw_field in nested_confidence:
+                values[target_name] = _coerce_confidence(nested_confidence.get(raw_field))
+            elif raw_field and raw_field in nested_labels:
+                values[target_name] = _coerce_confidence(nested_labels.get(raw_field))
+            elif raw_field and raw_field in nested_appraisal:
+                values[target_name] = _coerce_confidence(nested_appraisal.get(raw_field))
+            elif target_name in nested_confidence:
+                values[target_name] = _coerce_confidence(nested_confidence.get(target_name))
+            elif target_name in nested_labels:
+                values[target_name] = _coerce_confidence(nested_labels.get(target_name))
+            else:
+                values[target_name] = None
+
+    if not values:
+        return [0.0 if value is None else 1.0 for value in appraisal]
+
+    aligned = []
+    for appraisal_value, target_name in zip(appraisal, APPRAISAL_NAMES):
+        confidence = values.get(target_name)
+        if appraisal_value is None:
+            aligned.append(0.0)
+        elif confidence is None:
+            aligned.append(1.0)
+        else:
+            aligned.append(confidence)
+    return aligned
+
+
 def _normalize_labels(container: dict[str, Any], spec: dict[str, Any]) -> TurnLabels:
     labels_source = container.get(spec.get("labels_field"), container) if spec.get("labels_field") else container
     if not isinstance(labels_source, dict):
         labels_source = container
+
+    if spec.get("discrete_onehot_fields"):
+        discrete_source: Any = [
+            field
+            for field in spec.get("discrete_onehot_fields", [])
+            if _is_positive_label(labels_source.get(field, container.get(field)))
+        ]
+    else:
+        discrete_source = labels_source.get(spec.get("discrete_field", "discrete"))
+
+    appraisal = _extract_appraisal(labels_source, spec)
     return TurnLabels(
         vad=_extract_vad(labels_source, spec),
-        appraisal=_extract_appraisal(labels_source, spec),
-        discrete=_map_discrete_label(labels_source.get(spec.get("discrete_field", "discrete")), spec),
+        appraisal=appraisal,
+        appraisal_confidence=_extract_appraisal_confidence(labels_source, spec, appraisal),
+        discrete=_map_discrete_label(discrete_source, spec),
     )
 
 
@@ -330,6 +460,7 @@ def _load_single_turn_dialogues(spec: dict[str, Any]) -> list[RawDialogue]:
     dialogue_field = spec.get("dialogue_field")
     character_field = spec.get("character_field")
     speaker_field = spec.get("speaker_field")
+    split_field = spec.get("split_field")
     dialogues = []
     for index, row in enumerate(rows):
         text = str(row.get(text_field, "")).strip()
@@ -342,6 +473,7 @@ def _load_single_turn_dialogues(spec: dict[str, Any]) -> list[RawDialogue]:
                 dataset_name=spec["name"],
                 dialogue_id=dialogue_id,
                 turns=[RawTurn(speaker_id=speaker_id, text=text, order_index=0, labels=_normalize_labels(row, spec))],
+                source_split=_normalize_split_name(row.get(split_field)) if split_field else None,
             )
         )
     return dialogues
@@ -375,7 +507,14 @@ def _load_dialogue_table(spec: dict[str, Any]) -> list[RawDialogue]:
                 )
             )
         if turns:
-            dialogues.append(RawDialogue(dataset_name=spec["name"], dialogue_id=dialogue_id, turns=turns))
+            dialogues.append(
+                RawDialogue(
+                    dataset_name=spec["name"],
+                    dialogue_id=dialogue_id,
+                    turns=turns,
+                    source_split=_normalize_split_name(spec.get("fixed_split")),
+                )
+            )
     return dialogues
 
 
@@ -404,7 +543,126 @@ def _load_dialogue_jsonl(spec: dict[str, Any]) -> list[RawDialogue]:
                 )
             )
         if turns:
-            dialogues.append(RawDialogue(dataset_name=spec["name"], dialogue_id=dialogue_id, turns=turns))
+            dialogues.append(
+                RawDialogue(
+                    dataset_name=spec["name"],
+                    dialogue_id=dialogue_id,
+                    turns=turns,
+                    source_split=_normalize_split_name(spec.get("fixed_split")),
+                )
+            )
+    return dialogues
+
+
+def _parse_string_dialogue_list(raw_value: str) -> list[str]:
+    try:
+        parsed = ast.literal_eval(raw_value)
+    except Exception as exc:
+        pattern = re.compile(r"""(['"])(.*?)(?<!\\)\1""", re.DOTALL)
+        recovered = []
+        for match in pattern.finditer(raw_value):
+            recovered.append(ast.literal_eval(match.group(0)))
+        if recovered:
+            return [str(item).strip() for item in recovered if str(item).strip()]
+        raise ValueError(f"Could not parse packed dialogue list: {raw_value[:120]}") from exc
+    if not isinstance(parsed, list):
+        raise ValueError(f"Packed dialogue is not a list: {raw_value[:120]}")
+    items = [str(item).strip() for item in parsed if str(item).strip()]
+    if len(items) == 1:
+        pattern = re.compile(r"""(['"])(.*?)(?<!\\)\1""", re.DOTALL)
+        recovered = []
+        for match in pattern.finditer(raw_value):
+            recovered.append(ast.literal_eval(match.group(0)))
+        if len(recovered) > 1:
+            items = [str(item).strip() for item in recovered if str(item).strip()]
+    return items
+
+
+def _parse_numeric_bracket_list(raw_value: str) -> list[str]:
+    cleaned = raw_value.strip().lstrip("[").rstrip("]").strip()
+    if not cleaned:
+        return []
+    return cleaned.split()
+
+
+def _load_packed_dialogue_table(spec: dict[str, Any]) -> list[RawDialogue]:
+    dialogues = []
+    text_field = spec.get("text_field", "dialog")
+    emotion_field = spec.get("emotion_field", "emotion")
+
+    for index, row in enumerate(_read_records(Path(spec["path"]), spec["format"])):
+        utterances = _parse_string_dialogue_list(str(row.get(text_field, "[]")))
+        emotion_values = _parse_numeric_bracket_list(str(row.get(emotion_field, "[]")))
+        turns = []
+        for turn_index, utterance in enumerate(utterances):
+            emotion_value = emotion_values[turn_index] if turn_index < len(emotion_values) else None
+            labels_container = {spec.get("discrete_field", "discrete"): emotion_value}
+            turns.append(
+                RawTurn(
+                    speaker_id=f"speaker_{turn_index % 2}",
+                    text=utterance,
+                    order_index=turn_index,
+                    labels=_normalize_labels(labels_container, spec),
+                )
+            )
+        if turns:
+            dialogues.append(
+                RawDialogue(
+                    dataset_name=spec["name"],
+                    dialogue_id=str(row.get(spec.get("dialogue_field", "dialogue_id"), f"{spec['name']}-{index}")),
+                    turns=turns,
+                    source_split=_normalize_split_name(spec.get("fixed_split")),
+                )
+            )
+    return dialogues
+
+
+_SPEAKER_SEGMENT_PATTERN = re.compile(r"(Customer|Agent)\s*:(.*?)(?=(?:Customer|Agent)\s*:|$)", re.DOTALL)
+
+
+def _parse_empathetic_turns(prompt: str, response: str) -> list[tuple[str, str]]:
+    turns: list[tuple[str, str]] = []
+    for speaker, content in _SPEAKER_SEGMENT_PATTERN.findall(prompt):
+        text = content.strip()
+        if text:
+            turns.append((speaker.lower(), text))
+
+    reply = response.strip()
+    if reply:
+        if not turns or turns[-1][0] != "agent" or turns[-1][1] != reply:
+            turns.append(("agent", reply))
+    return turns
+
+
+def _load_empathetic_dialogues_csv(spec: dict[str, Any]) -> list[RawDialogue]:
+    dialogues = []
+    dialogue_field = spec.get("dialogue_field", "")
+    prompt_field = spec.get("prompt_field", "empathetic_dialogues")
+    response_field = spec.get("response_field", "labels")
+    emotion_field = spec.get("discrete_field", "emotion")
+
+    for index, row in enumerate(_read_records(Path(spec["path"]), spec["format"])):
+        dialogue_id = str(row.get(dialogue_field, index)) if dialogue_field else f"{spec['name']}-{index}"
+        prompt = str(row.get(prompt_field, "") or "")
+        response = str(row.get(response_field, "") or "")
+        parsed_turns = _parse_empathetic_turns(prompt, response)
+        if not parsed_turns:
+            continue
+
+        turns = []
+        for turn_index, (speaker_id, text) in enumerate(parsed_turns):
+            labels_container: dict[str, Any] = {}
+            if turn_index == 0:
+                labels_container[emotion_field] = row.get(emotion_field)
+            turns.append(
+                RawTurn(
+                    speaker_id=speaker_id,
+                    text=text,
+                    order_index=turn_index,
+                    labels=_normalize_labels(labels_container, spec),
+                )
+            )
+        dialogues.append(RawDialogue(dataset_name=spec["name"], dialogue_id=dialogue_id, turns=turns))
     return dialogues
 
 
@@ -423,6 +681,10 @@ def _raw_dialogues_from_spec(spec: dict[str, Any]) -> list[RawDialogue]:
         return _load_dialogue_table(spec)
     if adapter == "dialogue_jsonl":
         return _load_dialogue_jsonl(spec)
+    if adapter == "packed_dialogue_table":
+        return _load_packed_dialogue_table(spec)
+    if adapter == "empathetic_dialogues_csv":
+        return _load_empathetic_dialogues_csv(spec)
     raise ValueError(f"Unsupported adapter for raw dialogue loading: {adapter}")
 
 
@@ -541,24 +803,48 @@ def build_unified_dataset(recipe: dict[str, Any]) -> dict[str, list[DialogueExam
         seed=int(vector_cfg.get("seed", 42)),
     )
 
-    all_examples: list[DialogueExample] = []
+    assigned_splits: dict[str, list[DialogueExample]] = {"train": [], "val": [], "test": []}
+    unsplit_examples: list[DialogueExample] = []
     for spec in recipe.get("datasets", []):
+        if not bool(spec.get("enabled", True)):
+            continue
+
+        dataset_path = Path(spec["path"])
+        if not dataset_path.exists():
+            if bool(spec.get("skip_if_missing", False)):
+                print(f"[preprocess] Skipping missing dataset: {dataset_path}")
+                continue
+            raise FileNotFoundError(f"Dataset path not found: {dataset_path}")
+
         adapter = spec["adapter"]
         if adapter == "unified_jsonl":
-            all_examples.extend(_load_unified_jsonl(spec, character_dim=vector_factory.dim))
+            target_split = _normalize_split_name(spec.get("fixed_split"))
+            loaded_examples = _load_unified_jsonl(spec, character_dim=vector_factory.dim)
+            if target_split in assigned_splits:
+                assigned_splits[target_split].extend(loaded_examples)
+            else:
+                unsplit_examples.extend(loaded_examples)
             continue
 
         raw_dialogues = _raw_dialogues_from_spec(spec)
         for raw_dialogue in raw_dialogues:
-            all_examples.extend(
-                _target_character_samples(
-                    raw_dialogue=raw_dialogue,
-                    vector_factory=vector_factory,
-                    max_turn_distance=int(turn_distance_cfg.get("max_value", 15)),
-                )
+            examples = _target_character_samples(
+                raw_dialogue=raw_dialogue,
+                vector_factory=vector_factory,
+                max_turn_distance=int(turn_distance_cfg.get("max_value", 15)),
             )
+            target_split = raw_dialogue.source_split or _normalize_split_name(spec.get("fixed_split"))
+            if target_split in assigned_splits:
+                assigned_splits[target_split].extend(examples)
+            else:
+                unsplit_examples.extend(examples)
 
-    splits = _split_examples(all_examples, recipe.get("splits", {}) or {})
+    random_splits = _split_examples(unsplit_examples, recipe.get("splits", {}) or {})
+    splits = {
+        "train": assigned_splits["train"] + random_splits["train"],
+        "val": assigned_splits["val"] + random_splits["val"],
+        "test": assigned_splits["test"] + random_splits["test"],
+    }
     output_dir = Path(output_cfg.get("dir", "processed_data"))
     _write_jsonl(output_dir / output_cfg.get("train_file", "train.jsonl"), splits["train"])
     _write_jsonl(output_dir / output_cfg.get("val_file", "val.jsonl"), splits["val"])

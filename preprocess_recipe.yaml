@@ -23,52 +23,130 @@ datasets:
   - name: goemotions
     adapter: single_turn_table
     format: csv
-    path: raw/goemotions.csv
+    path: C:\Users\SSAFY\.cache\kagglehub\datasets\shivamb\go-emotions-google-emotions-dataset\versions\1\go_emotions_dataset.csv
     text_field: text
     dialogue_field: id
-    character_field: author_id
-    discrete_field: labels
+    character_field: id
     discrete_map: goemotions
     multi_label_policy: first_supported
+    discrete_onehot_fields:
+      - admiration
+      - amusement
+      - anger
+      - annoyance
+      - approval
+      - caring
+      - confusion
+      - curiosity
+      - desire
+      - disappointment
+      - disapproval
+      - disgust
+      - embarrassment
+      - excitement
+      - fear
+      - gratitude
+      - grief
+      - joy
+      - love
+      - nervousness
+      - optimism
+      - pride
+      - realization
+      - relief
+      - remorse
+      - sadness
+      - surprise
+      - neutral
 
   - name: emobank
     adapter: single_turn_table
     format: csv
-    path: raw/emobank.csv
+    path: C:\Users\SSAFY\.cache\kagglehub\datasets\jackksoncsie\emobank\versions\1\emobank.csv
     text_field: text
     dialogue_field: id
-    vad_fields: [v, a, d]
+    character_field: id
+    split_field: split
+    vad_fields: [V, A, D]
     vad_range: [1.0, 5.0]
 
-  - name: meld
+  - name: dailydialog_train
+    adapter: packed_dialogue_table
+    format: csv
+    path: C:\Users\SSAFY\.cache\kagglehub\datasets\thedevastator\dailydialog-unlock-the-conversation-potential-in\versions\2\train.csv
+    fixed_split: train
+    text_field: dialog
+    emotion_field: emotion
+    discrete_field: emotion
+    discrete_map: dailydialog
+
+  - name: dailydialog_validation
+    adapter: packed_dialogue_table
+    format: csv
+    path: C:\Users\SSAFY\.cache\kagglehub\datasets\thedevastator\dailydialog-unlock-the-conversation-potential-in\versions\2\validation.csv
+    fixed_split: val
+    text_field: dialog
+    emotion_field: emotion
+    discrete_field: emotion
+    discrete_map: dailydialog
+
+  - name: dailydialog_test
+    adapter: packed_dialogue_table
+    format: csv
+    path: C:\Users\SSAFY\.cache\kagglehub\datasets\thedevastator\dailydialog-unlock-the-conversation-potential-in\versions\2\test.csv
+    fixed_split: test
+    text_field: dialog
+    emotion_field: emotion
+    discrete_field: emotion
+    discrete_map: dailydialog
+
+  - name: empatheticdialogues
+    adapter: empathetic_dialogues_csv
+    format: csv
+    path: C:\Users\SSAFY\.cache\kagglehub\datasets\atharvjairath\empathetic-dialogues-facebook-ai\versions\1\emotion-emotion_69k.csv
+    prompt_field: empathetic_dialogues
+    response_field: labels
+    discrete_field: emotion
+    discrete_map: empatheticdialogues
+
+  - name: meld_train
     adapter: dialogue_table
     format: csv
-    path: raw/meld_train.csv
+    path: raw\MELD\train_sent_emo.csv
+    fixed_split: train
     dialogue_field: Dialogue_ID
     turn_field: Utterance_ID
     speaker_field: Speaker
     text_field: Utterance
     discrete_field: Emotion
     discrete_map: meld
+    skip_if_missing: true
 
-  - name: dailydialog
-    adapter: dialogue_jsonl
-    format: jsonl
-    path: raw/dailydialog.jsonl
-    dialogue_field: dialogue_id
-    turns_field: turns
-    speaker_field: speaker
-    text_field: text
-    discrete_field: emotion
-    discrete_map: dailydialog
-
-  - name: empatheticdialogues
+  - name: meld_dev
     adapter: dialogue_table
     format: csv
-    path: raw/empatheticdialogues.csv
-    dialogue_field: conv_id
-    turn_field: utterance_idx
-    speaker_field: speaker_idx
-    text_field: utterance
-    discrete_field: emotion
-    discrete_map: empatheticdialogues
+    path: raw\MELD\dev_sent_emo.csv
+    fixed_split: val
+    dialogue_field: Dialogue_ID
+    turn_field: Utterance_ID
+    speaker_field: Speaker
+    text_field: Utterance
+    discrete_field: Emotion
+    discrete_map: meld
+    skip_if_missing: true
+
+  - name: meld_test
+    adapter: dialogue_table
+    format: csv
+    path: raw\MELD\test_sent_emo.csv
+    fixed_split: test
+    dialogue_field: Dialogue_ID
+    turn_field: Utterance_ID
+    speaker_field: Speaker
+    text_field: Utterance
+    discrete_field: Emotion
+    discrete_map: meld
+    skip_if_missing: true
+
+# Official MELD source:
+# https://github.com/declare-lab/MELD

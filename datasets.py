@@ -41,6 +41,7 @@ APPRAISAL_NAMES = [
 class TurnLabels:
     vad: Optional[List[Optional[float]]] = None
     appraisal: Optional[List[Optional[float]]] = None
+    appraisal_confidence: Optional[List[Optional[float]]] = None
     discrete: Optional[int] = None
 
 
@@ -67,18 +68,50 @@ def _normalize_vector(vector: Iterable[float], dim: int) -> List[float]:
     return values + [0.0] * (dim - len(values))
 
 
+def _normalize_optional_sequence(values: Optional[Iterable[Any]], dim: int, name: str) -> Optional[List[Optional[float]]]:
+    if values is None:
+        return None
+    sequence = [None if value is None else float(value) for value in values]
+    if len(sequence) != dim:
+        raise ValueError(f"{name} must contain exactly {dim} values, got {len(sequence)}")
+    return sequence
+
+
+def _default_appraisal_confidence(appraisal: Optional[List[Optional[float]]]) -> Optional[List[Optional[float]]]:
+    if appraisal is None:
+        return None
+    return [0.0 if value is None else 1.0 for value in appraisal]
+
+
 def dialogue_from_dict(payload: dict[str, Any], character_dim: int = 64) -> DialogueExample:
     turns = []
     for index, raw_turn in enumerate(payload.get("turns", [])):
         labels = raw_turn.get("labels", {}) or {}
+        vad = _normalize_optional_sequence(labels.get("vad"), dim=3, name="vad")
+        appraisal = _normalize_optional_sequence(labels.get("appraisal"), dim=len(APPRAISAL_NAMES), name="appraisal")
+        appraisal_confidence = _normalize_optional_sequence(
+            labels.get("appraisal_confidence"),
+            dim=len(APPRAISAL_NAMES),
+            name="appraisal_confidence",
+        )
+        if appraisal is None:
+            appraisal_confidence = None
+        elif appraisal_confidence is None:
+            appraisal_confidence = _default_appraisal_confidence(appraisal)
+        else:
+            appraisal_confidence = [
+                0.0 if appraisal_value is None else max(0.0, min(1.0, float(confidence or 0.0)))
+                for appraisal_value, confidence in zip(appraisal, appraisal_confidence)
+            ]
         turns.append(
             DialogueTurn(
                 role=str(raw_turn.get("role", "self")).lower(),
                 text=str(raw_turn.get("text", "")).strip(),
                 turn_distance=int(raw_turn.get("turn_distance", 0 if index == 0 else 1)),
                 labels=TurnLabels(
-                    vad=labels.get("vad"),
-                    appraisal=labels.get("appraisal"),
+                    vad=vad,
+                    appraisal=appraisal,
+                    appraisal_confidence=appraisal_confidence,
                     discrete=labels.get("discrete"),
                 ),
             )
@@ -107,6 +140,7 @@ def dialogue_to_dict(example: DialogueExample) -> dict[str, Any]:
                 "labels": {
                     "vad": turn.labels.vad,
                     "appraisal": turn.labels.appraisal,
+                    "appraisal_confidence": turn.labels.appraisal_confidence,
                     "discrete": turn.labels.discrete,
                 },
             }
@@ -175,12 +209,22 @@ def _vector_from_seed(seed: int, dim: int) -> List[float]:
     return [round(value / norm, 4) for value in values]
 
 
+def _with_default_appraisal_confidence(turns: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    for turn in turns:
+        labels = turn.get("labels", {}) or {}
+        appraisal = labels.get("appraisal")
+        if appraisal is not None and labels.get("appraisal_confidence") is None:
+            labels["appraisal_confidence"] = _default_appraisal_confidence(appraisal)
+        turn["labels"] = labels
+    return turns
+
+
 def _record(dialogue_id: str, character_id: str, seed: int, turns: list[dict[str, Any]], character_dim: int) -> dict[str, Any]:
     return {
         "dialogue_id": dialogue_id,
         "character_id": character_id,
         "character_vector": _vector_from_seed(seed, character_dim),
-        "turns": turns,
+        "turns": _with_default_appraisal_confidence(turns),
     }
 
 

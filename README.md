@@ -49,6 +49,7 @@ character_vector -> h0, char_step ----------------------+
 |- text2emotion.py
 |- losses.py
 |- trainer.py
+|- annotate_appraisals.py
 |- inference.py
 |- visualizer.py
 |- requirements.txt
@@ -143,6 +144,24 @@ Fields:
 - `appraisal`: five aligned appraisal values in this order:
   `coping`, `goal_relevance`, `novelty`, `pleasantness`, `norm_fit`
 - `discrete`: integer class id from the 14-class discrete label set
+
+If a dataset does not provide one of these labels, that target stays missing
+and its supervised loss is masked out. This is the current situation for
+appraisal on the merged real-data corpus.
+
+Planned extension for synthetic appraisal supervision:
+
+```json
+"labels": {
+  "vad": [0.20, 0.45, -0.10],
+  "appraisal": [0.30, 0.85, null, -0.25, 0.10],
+  "appraisal_confidence": [0.95, 0.80, 0.00, 0.60, 0.70],
+  "discrete": 4
+}
+```
+
+`appraisal_confidence` is the supported schema for confidence-weighted
+synthetic appraisal training.
 
 The dataset intentionally does not store raw speaker names. The model only uses
 `role` (`self` or `other`) because names alone do not provide useful emotional
@@ -253,6 +272,12 @@ z_stable = gate * z_t + (1 - gate) * z_prev
 
 Training is split into three explicit stages in `trainer.py`.
 
+With the current merged corpus, training should not be blocked on appraisal.
+The model keeps the appraisal head so the latent stays compatible with later
+supervision, but missing appraisal labels are masked and contribute zero loss.
+Stage-specific appraisal weighting is controlled by
+`training.appraisal_stage_weights` in `config.yaml`.
+
 ### Stage 1: base
 
 `model.set_stage("base")`
@@ -260,11 +285,11 @@ Training is split into three explicit stages in `trainer.py`.
 Train the backbone around `z_emotion`:
 
 - VAD regression
-- appraisal regression
 - discrete classification
 - label-aware smoothness
 - contrastive loss on same-label-and-role pairs
 - consistency loss to keep same-label + same-role states close in latent space
+- appraisal head present, but appraisal loss masked until labels exist
 
 The inertia gate is frozen in this stage.
 
@@ -275,9 +300,11 @@ The inertia gate is frozen in this stage.
 Freeze the base model and train only the inertia gate using losses on
 `z_stable`:
 
-- VAD/appraisal/discrete supervision through the stabilized latent
+- VAD/discrete supervision through the stabilized latent
 - smoothness pressure on `z_stable`
 - fidelity loss: `||z_stable - z_emotion||` to prevent over-smoothing
+- later add confidence-weighted appraisal supervision when synthetic labels are
+  available
 
 ### Stage 3: joint
 
@@ -285,6 +312,51 @@ Freeze the base model and train only the inertia gate using losses on
 
 Unfreeze everything and optimize both objectives together, with gate losses
 scaled by `joint_gate_scale`.
+
+Recommended order with the current dataset mix:
+
+1. Train the base system now with discrete, VAD, and temporal losses.
+2. Add synthetic appraisal labels later instead of forcing noisy supervision
+   into an unstable latent too early.
+3. Jointly fine-tune all heads after the appraisal pipeline is validated.
+
+## Synthetic Appraisal Plan
+
+Appraisal is the only major supervision gap in the current corpus. The fastest
+practical path is to bootstrap it from the dialogue data you already have.
+
+For each turn, label:
+
+- `coping`
+- `goal_relevance`
+- `novelty`
+- `pleasantness`
+- `norm_fit`
+
+Use as annotation inputs:
+
+- current turn text
+- recent dialogue context
+- target-character-relative `role`
+
+Recommended process:
+
+1. Generate synthetic appraisal labels with an LLM on the training split.
+2. Store both appraisal values and per-dimension confidence scores.
+3. Weight appraisal loss by confidence so uncertain labels act as weak hints.
+4. Manually review a few hundred samples to calibrate prompts and catch bias.
+
+This keeps the base emotion model moving now while leaving a clean path toward
+later appraisal supervision.
+
+Example command:
+
+```powershell
+basic_env\Scripts\python.exe annotate_appraisals.py --input-path processed_data/train.jsonl --output-path processed_data/train_appraisal_annotated.jsonl --provider mock --report-path outputs/appraisal_annotation_report.json
+```
+
+Swap `--provider mock` for `--provider openai_compatible` and set
+`OPENAI_API_KEY` when you want real LLM annotations.
 
 ## How The Code Flows
 
@@ -314,9 +386,18 @@ scaled by `joint_gate_scale`.
 ### `losses.py`
 
 - converts turn labels into tensors and masks
+- applies confidence-weighted appraisal regression when
+  `appraisal_confidence` is present
 - computes regression, classification, smoothness, contrastive, and
   consistency losses
-- switches behavior depending on training stage
+- switches behavior depending on training stage and appraisal stage weight
+
+### `annotate_appraisals.py`
+
+- reads unified dialogue JSONL and annotates each turn with appraisal values
+- stores per-dimension `appraisal_confidence`
+- supports a local `mock` annotator for dry runs and an `openai_compatible`
+  backend for real synthetic labeling
 
 ### `trainer.py`
 
@@ -346,6 +427,7 @@ Useful sections:
 
 - `model`: architecture dimensions and encoder behavior
 - `training`: epochs, learning rates, loss weights, checkpoint directory
+- `training.appraisal_stage_weights`: stage-specific scaling for appraisal loss
 - `data`: train/validation file paths
 - `inference`: default JSON output path
 
@@ -372,6 +454,7 @@ After training or smoke testing, the main artifacts are:
 This is a solid scaffold, not a finished research system yet.
 
 - sample data is synthetic and tiny
+- the merged real-data corpus currently has no direct appraisal supervision
 - there is no dedicated evaluation script beyond smoke training and plotting
 - the fallback text encoder is useful for offline execution, but much weaker
   than a trained transformer backbone
@@ -382,9 +465,12 @@ This is a solid scaffold, not a finished research system yet.
 
 If you want to keep developing this project, the highest-value next steps are:
 
-1. Replace the sample dataset with real dialogue emotion annotations.
-2. Add a proper experiment/evaluation loop with held-out metrics by task.
-3. Reintroduce speaker identity only as a learned `speaker_embedding` if you
+1. Keep training the current merged corpus with VAD, discrete, and temporal
+   losses while appraisal stays masked.
+2. Add synthetic appraisal labels plus per-dimension confidence scores on the
+   training split.
+3. Add a proper experiment/evaluation loop with held-out metrics by task.
+4. Reintroduce speaker identity only as a learned `speaker_embedding` if you
    need relationship-aware modeling.
-4. Add a downstream decoder from `z_stable` to facial action units or rig
+5. Add a downstream decoder from `z_stable` to facial action units or rig
    controls.

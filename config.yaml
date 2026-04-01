@@ -44,6 +44,10 @@ training:
   contrastive_margin: 0.5
   label_smoothing: 0.0
   joint_gate_scale: 0.5
+  appraisal_stage_weights:
+    base: 0.0
+    gate: 0.6
+    joint: 1.0
   checkpoint_dir: checkpoints
   seed: 42
   loss_weights:
@@ -57,8 +61,8 @@ training:
     gate_fidelity: 0.2
 
 data:
-  train_path: sample_data/train.jsonl
-  val_path: sample_data/val.jsonl
+  train_path: processed_data/train.jsonl
+  val_path: processed_data/val.jsonl
 
 inference:
   output_path: outputs/inference.json

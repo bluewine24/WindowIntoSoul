@@ -46,7 +46,19 @@ def build_optimizer(model: TextToEmotionTrajectoryModel, config: dict[str, Any],
 
 
 def summarise_metrics(metrics: dict[str, float]) -> str:
-    keys = ["total", "vad", "appraisal", "discrete", "smoothness", "gate_smoothness", "gate_fidelity"]
+    keys = [
+        "total",
+        "vad",
+        "stable_vad",
+        "appraisal",
+        "stable_appraisal",
+        "discrete",
+        "stable_discrete",
+        "smoothness",
+        "gate_smoothness",
+        "gate_fidelity",
+        "appraisal_stage_weight",
+    ]
     parts = []
     for key in keys:
         if key in metrics:
@@ -67,6 +79,7 @@ def run_epoch(
     model.train(training)
     totals: dict[str, float] = {}
     steps = 0
+    skipped_backward_steps = 0
 
     for batch_index, batch in enumerate(dataloader, start=1):
         if limit_batches is not None and batch_index > limit_batches:
@@ -79,9 +92,12 @@ def run_epoch(
             outputs = model(batch, use_stable_history=not training)
             losses = criterion(model, outputs, batch, stage=stage)
             if training:
-                losses["total"].backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=gradient_clip_norm)
-                optimizer.step()
+                if losses["total"].requires_grad:
+                    losses["total"].backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=gradient_clip_norm)
+                    optimizer.step()
+                else:
+                    skipped_backward_steps += 1
 
         for name, value in losses.items():
             totals[name] = totals.get(name, 0.0) + float(value.detach().cpu().item())
@@ -89,7 +105,10 @@ def run_epoch(
 
     if steps == 0:
         return {"total": 0.0}
-    return {name: value / steps for name, value in totals.items()}
+    averaged = {name: value / steps for name, value in totals.items()}
+    if training and skipped_backward_steps:
+        averaged["skipped_backward_steps"] = float(skipped_backward_steps)
+    return averaged
 
 
 def save_checkpoint(
